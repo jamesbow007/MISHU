@@ -1,0 +1,27 @@
+# 依赖
+node_modules/
+
+# 运行时产物（含 cookie 明文，绝不能提交）
+data/
+*.log
+*.png
+*.pdf
+
+# 内部技术笔记（逆向细节、踩坑记录 —— 不对外公开）
+docs/
+
+# MCP 注册配置（含本地绝对路径；本机保留，不随仓库走）
+.mcp.json
+
+# 环境
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo

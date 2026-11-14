@@ -1,0 +1,37 @@
+{
+  "name": "mishu",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "常驻自动投递：后台挂着，扫「新招呼」里带红点的会话，自动发附件简历",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "probe": "tsx src/scripts/probe-messages.ts",
+    "unread": "tsx src/scripts/read-unread.ts",
+    "greeting": "tsx src/scripts/read-greeting.ts",
+    "head": "tsx src/scripts/read-head.ts",
+    "job": "tsx src/scripts/read-job.ts",
+    "login": "tsx src/scripts/login.ts",
+    "verify": "tsx src/scripts/verify.ts",
+    "bridge": "tsx src/scripts/bridge-server.ts",
+    "deliver": "tsx src/scripts/deliver-chat.ts",
+    "probe:greeting": "tsx src/scripts/probe-greeting.ts",
+    "ext:reload": "tsx src/scripts/ext-reload.ts",
+    "watch": "tsx src/scripts/watch.ts",
+    "watch:bg": "tsx src/scripts/watch.ts --bg",
+    "watch:stop": "tsx src/scripts/watch.ts --stop",
+    "watch:status": "tsx src/scripts/watch.ts --status"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
