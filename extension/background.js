@@ -1070,7 +1070,12 @@ function pageGreetingTask(arg) {
     });
   };
 
-  /** 排除名单：最近投过/失败过的会话（同名 HR 靠公司名区分） */
+  /**
+   * 本轮已试过的会话（同名 HR 靠公司名区分）。
+   *
+   * ⚠️ 这里**不是**「投过的人的名单」—— 那个由红点天然承担了。
+   * 这份只是防止一轮里反复挑中同一个「点了没打开」的会话。
+   */
   const isExcluded = (r) => {
     const exclude = Array.isArray(A.exclude) ? A.exclude : [];
     return exclude.some((ex) => {
@@ -1080,6 +1085,37 @@ function pageGreetingTask(arg) {
       if (ec && r.text && !r.text.includes(ec)) return false;
       return true;
     });
+  };
+
+  /** 「新招呼」是不是当前选中的 tab（切 tab 后列表要重新拉，这中间读到的是旧列表） */
+  const isOnNewTab = () => {
+    const tab = findTabs()['新招呼'];
+    if (!tab) return false;
+    const li = tab.closest ? tab.closest('li') : null;
+    return !!(li && /selected|active/i.test(String(li.className || '')));
+  };
+
+  /**
+   * 切到「新招呼」之后，列表接口回来了没有？
+   *
+   * 列表内容是异步拉的：切 tab → 页面发请求 → 回来才渲染。
+   * 界面挂上了不代表列表到货 —— 这中间差着一次网络往返，弱网时能差好几秒。
+   *
+   * 判据用「切 tab 之后有没有发出过列表请求」（performance 的 resource 记录），
+   * 而不是「等 N 毫秒」。
+   */
+  const listFetchedAfterSwitch = () => {
+    const switchedAt = Number((window && window.__mishuSwitchedAt) || 0);
+    if (!switchedAt) return true; // 没切过 tab → 列表本来就是加载好的
+    try {
+      return performance.getEntriesByType('resource').some((e) => {
+        if (!e.name.includes('geekFilterByLabel')) return false;
+        const at = performance.timeOrigin + e.startTime;
+        return at >= switchedAt - 500;
+      });
+    } catch (e) {
+      return true; // 读不到就当它好了，别卡死
+    }
   };
 
   /* ================= 分派 ================= */
@@ -1124,6 +1160,13 @@ function pageGreetingTask(arg) {
   if (mode === 'scan') {
     const rows = collectRows(false);
     out.rowCount = rows.length;
+    // 当前选中的是不是「新招呼」—— 切 tab 后列表要重新拉，
+    // 这中间读到的可能是上一个 tab 的旧列表。Node 侧靠这个判断该不该等。
+    out.onNewTab = isOnNewTab();
+    // 切 tab 之后列表是**重新拉接口**才有的。
+    //   界面挂上了 ≠ 列表到货 —— 冷启动时这两件事差着一次网络往返。
+    //   用「切 tab 之后有没有发出过列表请求」这个事实来判断，别猜时间。
+    out.listFresh = listFetchedAfterSwitch();
     // 页面是否就绪 —— 用来区分「列表是空的」和「列表还没渲染出来」。
     // 聊天页一加载完就有 tab 栏和会话面板，哪怕一条会话都没有。
     out.ready = !!(
@@ -1147,40 +1190,43 @@ function pageGreetingTask(arg) {
       return out;
     }
     out.tabCls = String(tab.className || '');
-    // 已经在「新招呼」上了就别再等渲染 —— 切 tab 会触发列表重载，
-    // 没切的时候那 1.2 秒纯属白等（每投一个人都要切一次）。
+    // 已经在「新招呼」上了就**别再点** ——
+    //   ① 点了会触发列表重载，白等 1.2 秒；
+    //   ② 更要命的是重载那一瞬间列表是 0 行，会被误判成「列表空了」。
     const li = tab.closest ? tab.closest('li') : null;
     out.alreadyOn = !!(li && /selected|active/i.test(String(li.className || '')));
-    tab.click();
+    if (!out.alreadyOn) {
+      tab.click();
+      // 记下切的时间 —— 后面 scan 用它判断「列表接口回来了没有」
+      try { window.__mishuSwitchedAt = Date.now(); } catch (e) { /* ignore */ }
+    }
     out.ok = true;
     out.step = 'switched';
     return out;
   }
 
   if (mode === 'open') {
+    // 还没切到「新招呼」→ 读到的可能是上一个 tab 的旧列表，不能拿它选人
+    if (!isOnNewTab()) {
+      out.ok = false;
+      out.step = 'not-on-tab';
+      return out;
+    }
     const rows = collectRows(false);
     out.rowCount = rows.length;
     if (!rows.length) {
-      // 「0 行」有两种可能，页面侧要靠「聊天界面在不在」来分：
-      //   · 界面还没挂上 → 列表确实还没渲染出来 → 让 Node 侧重试
-      //   · 界面在、列表就是空的 → 真的没红点了
-      //     （刚投完的那个会话会离开「新招呼」标签，列表重渲染期间正好是空的；
-      //      不分清楚就会误报成「投递失败：会话列表还没渲染出来」）
-      const uiReady = !!(
-        document.querySelector('.label-list') ||
-        document.querySelector('.chat-conversation')
-      );
-      if (!uiReady) {
-        out.ok = false;
-        out.step = 'list-not-ready';
-        return out;
-      }
-      out.ok = true;
-      out.step = 'done';
-      out.done = true;
-      out.detail = '没有带红点的会话了';
+      // 列表 0 行 —— **不要**在这里判「没红点了」。
+      //   切 tab / 点开会话之后列表会重渲染（要重新拉接口），那一瞬间正好是 0 行；
+      //   这时候判「收工」会把后面还没投的人整个跳过。
+      // 交给 Node 侧重试（重试完还是空，才算真的收工）。
+      out.ok = false;
+      out.step = 'list-empty';
       return out;
     }
+    // 投递判据 = **红点**。
+    //   红点 = 没人打开过这个会话；投递必然要打开会话 → 投过的人红点必然消失
+    //   → 红点自己就是「还没投过」的标记，不需要另设排除名单。
+    // A.exclude 只用来挡「本轮已经试过、但没打开成功」的会话（防止一轮里反复挑中它）。
     const target = A.pick
       ? rows.find((r) => r.name === String(A.pick))
       : rows.find((r) => r.badge > 0 && !isExcluded(r));
@@ -1223,10 +1269,21 @@ function pageGreetingTask(arg) {
   }
 
   if (mode === 'verify-conv') {
-    const conv = txt(document.querySelector('.chat-conversation'));
+    // 「会话有没有真的打开」—— 判据是**会话头的 .name-text 在不在**。
+    // 没打开时这个面板显示的是空状态文案（「与您进行过沟通的 Boss 都会在左侧列表中显示」），
+    // 靠判空/判文案都不可靠，靠结构最稳。
+    //
+    // ⚠️ 这里**不**拿名字跟点开的那个行比对：
+    //   红点本来就只出现在一行上，点哪行就是哪个人，没有认错的余地。
+    //   之前拿名字比对反而误伤了 —— 会话加载慢一点就判成「同名 HR 对不上」，
+    //   活生生的招呼就这么被跳过。
+    const panel = document.querySelector('.chat-conversation');
+    const head = panel ? panel.querySelector('.name-text') : null;
     out.ok = true;
     out.step = 'conv';
-    out.conv = conv.slice(0, 200);
+    out.open = !!head;
+    out.name = head ? txt(head) : '';
+    out.conv = txt(panel).slice(0, 200);
     return out;
   }
 
@@ -1250,11 +1307,14 @@ function pageGreetingTask(arg) {
   }
 
   if (mode === 'check-panel') {
-    const panel = txt(document.querySelector('.panel-resume'));
+    const el = document.querySelector('.panel-resume');
+    const panel = txt(el);
     out.ok = true;
     out.step = 'panel';
     out.panel = panel.slice(0, 200);
-    out.hasPanel = !!panel && panel.includes('发送简历');
+    // hasPanel = 弹窗出现了；ready = 弹窗内容是「发送简历」（可以点确定了）
+    out.hasPanel = !!el;
+    out.ready = !!el && panel.includes('发送简历');
     return out;
   }
 

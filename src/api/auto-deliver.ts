@@ -137,12 +137,16 @@ export interface DeliverOutcome {
   ok: boolean;
   /** 没有更多红点了 —— 整轮可以结束 */
   done?: boolean;
-  /** 失败卡在哪一步：conv-mismatch / no-resume-btn / no-panel / no-sure-btn / … */
+  /** 失败卡在哪一步：conv-not-open / no-resume-btn / no-panel / no-sure-btn / … */
   step?: string;
-  /** 目标 HR 的名字 */
+  /** 目标 HR 的名字（会话头上读到的为准） */
   name?: string;
+  /** 点开的那一行上写的名字（跟 name 对不上说明点歪了，仅作日志用，不拦） */
+  clickedName?: string;
   /** 失败现场（会话头文本、弹窗文本…） */
   detail?: string;
+  /** 简历确认弹窗的文本 */
+  panel?: string;
   /** 打开的会话头部文本 */
   conv?: string;
   /** 红点上的未读条数 */
@@ -161,9 +165,10 @@ export interface DeliverOutcome {
 const STEP_REASON: Record<string, string> = {
   'no-tab': '页面上找不到「新招呼」tab（BOSS 改版了？）',
   'list-not-ready': '会话列表还没渲染出来',
+  'list-empty': '会话列表是空的',
   'row-name-unknown': '这一行读不出 HR 名字，不敢认人',
   'row-missing': '会话行在点击前消失了',
-  'conv-mismatch': '打开的会话和目标对不上（可能同名 HR），已停手',
+  'conv-not-open': '点了会话但它没打开（页面可能还没准备好）',
   'no-resume-btn': '聊天工具栏里没有「发简历」按钮（对方可能不支持）',
   'no-panel': '没弹出简历确认框',
   'no-sure-btn': '弹窗里找不到「确定」按钮',
@@ -171,17 +176,18 @@ const STEP_REASON: Record<string, string> = {
 };
 
 /**
- * 每一步之后，Node 侧要等多久页面才渲染好（毫秒）。
+ * 轮询节奏与上限。
  *
- * 只有「点了按钮、页面要重新渲染」的那几步才需要等；
- * 读一读的步骤（核对会话头、读弹窗）不用等。
+ * ⚠️ **这里只有「多久算超时」，没有「要等多久」**。
+ * 每一步等的是**状态**（会话打开了？弹窗出现了？列表切过去了？），
+ * 不是猜一个时长 —— 网络慢的时候等待自动变长，快的时候自动变短。
+ * 固定 sleep 在弱网下会把节奏全搞乱（实测 1600ms 硬等 → 会话没打开就被误判）。
  */
-const STEP_WAIT = {
-  'switch-tab': 1200,
-  'open': 1600,
-  'send-resume': 2000,
-  'confirm': 2500,
-} as const;
+const POLL_MS = 350;
+/** 各步的超时上限（只作兜底，正常情况下都由状态判定提前结束） */
+const TIMEOUT_CONV_OPEN = 15_000;
+const TIMEOUT_PANEL = 12_000;
+const TIMEOUT_LIST = 20_000;
 
 /** 调一次页面函数（url / 超时都用 runPageFn 的默认值，这里只给守恒进程专属的两项） */
 async function call(mode: string, extra: Record<string, any> = {}): Promise<any> {
@@ -189,15 +195,73 @@ async function call(mode: string, extra: Record<string, any> = {}): Promise<any>
 }
 
 /**
- * 切到「新招呼」tab，必要时等列表重载。
+ * 等「会话真的打开了」。
  *
- * 页面会报 alreadyOn（已经在「新招呼」上了）—— 切 tab 会触发列表重载，
- * 没切就等纯属白等。deliverNext 和 scanGreetings 都要走这一步，收在一处。
+ * 为什么不能死等一个固定时长：会话要拉消息历史，冷页面可能要好几秒
+ * （实测 8 秒）。之前固定等 1600ms → 会话还没打开 → 被误判成「同名 HR 对不上」
+ * → 招呼被白白跳过（一晚上 5 个招呼一个没投出去）。
+ *
+ * 也不拿名字跟点开的行比对 —— 红点只出现在一行上，点哪行就是哪个人，
+ * 没有认错的余地；拿名字卡反而会误伤。
+ */
+async function waitConvOpen(): Promise<{ open: boolean; name: string; text: string }> {
+  const deadline = Date.now() + TIMEOUT_CONV_OPEN;
+  let last = { open: false, name: '', text: '' };
+  for (;;) {
+    try {
+      const v = await call('verify-conv');
+      last = { open: !!v?.open, name: String(v?.name ?? ''), text: String(v?.conv ?? '') };
+      if (last.open) return last;
+    } catch {
+      /* 页面还没准备好 → 继续等 */
+    }
+    if (Date.now() >= deadline) return last;
+    await sleep(POLL_MS);
+  }
+}
+
+/** 等简历确认弹窗出现（并且内容是「发送简历」） */
+async function waitPanelOpen(): Promise<{ ready: boolean; text: string }> {
+  const deadline = Date.now() + TIMEOUT_PANEL;
+  let last = { ready: false, text: '' };
+  for (;;) {
+    try {
+      const p = await call('check-panel');
+      last = { ready: !!p?.ready, text: String(p?.panel ?? '') };
+      if (last.ready) return last;
+    } catch {
+      /* 继续等 */
+    }
+    if (Date.now() >= deadline) return last;
+    await sleep(POLL_MS);
+  }
+}
+
+/** 等弹窗关闭（点完「确定」之后弹窗会消失，说明这一步真的走了） */
+async function waitPanelClosed(): Promise<boolean> {
+  const deadline = Date.now() + TIMEOUT_PANEL;
+  for (;;) {
+    try {
+      const p = await call('check-panel');
+      if (p && p.hasPanel === false) return true;
+    } catch {
+      /* 继续等 */
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(POLL_MS);
+  }
+}
+
+/**
+ * 切到「新招呼」tab。
+ *
+ * **不在这儿等列表重载** —— 切完 tab 页面要去重新拉接口，耗时完全看网络，
+ * 猜一个时长必然错位。改成由 `open` 模式报「还没切过去 / 列表还是空的」，
+ * 这里轮询重试，等的是状态不是时间。
  */
 async function switchAndSettle(): Promise<{ ok: boolean; sw: any }> {
   const sw = await call('switch-tab');
   if (!sw?.ok) return { ok: false, sw };
-  if (!sw.alreadyOn) await sleep(STEP_WAIT['switch-tab']);
   return { ok: true, sw };
 }
 
@@ -205,7 +269,7 @@ async function switchAndSettle(): Promise<{ ok: boolean; sw: any }> {
  * 投掉**一个**带红点的新招呼。
  *
  * 分成好几步做，每步一次桥接任务：
- *   ① 切「新招呼」tab → ② 找到带红点的行并点开 → ③ 核对会话头
+ *   ① 切「新招呼」tab → ② 找到带红点的行并点开 → ③ 等会话真的打开
  *   → ④ 点「发简历」→ ⑤ 核对弹窗 → ⑥ 点「确定」→ ⑦ 回读消息
  *
  * 为什么不用「一次调用跑完整条链」：
@@ -214,7 +278,9 @@ async function switchAndSettle(): Promise<{ ok: boolean; sw: any }> {
  *   桥接任务必然 20 秒超时（实测踩过：简历发出去了，但任务超时，状态没记上）。
  *   把等待全挪到 Node 侧（Node 的定时器不会被限流），每步都很快。
  *
- * 认错人就在第③步停手，不会点「确定」。
+ * 第③步**不比对名字**：红点只出现在一行上，点哪行就是哪个人，
+ * 没有认错的余地；拿名字卡反而会误伤（实测一晚上 5 个招呼一个没投出去）。
+ * 只等「会话真的打开了」这个事实。
  */
 export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: string } = {}): Promise<DeliverOutcome> {
   const out: DeliverOutcome = { ok: false };
@@ -228,16 +294,43 @@ export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: strin
     return out;
   };
 
-  // ① 切到「新招呼」tab（列表没渲染出来就重试）
+  // ① 切到「新招呼」tab，找到带红点的行并点开
+  //
+  //    这里等的是**状态**不是时间：
+  //      · not-on-tab → tab 还没切过去（页面在重新渲染）
+  //      · list-empty → 列表还是空的（接口还没回来 / 重渲染中）
+  //    两种都重试；重试到上限还是空 → 真的没红点了。
+  //    （列表重渲染的那一瞬间正好是 0 行，这时候判「收工」会把后面
+  //      还没投的人整个跳过 —— 实测一晚上 5 个招呼只试了 3 个。）
   let opened: any = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let emptyTries = 0;
+  const deadline = Date.now() + TIMEOUT_LIST;
+  for (;;) {
     try {
       const r = await switchAndSettle();
       if (!r.ok) {
+        // 页面还没渲染出 tab 栏 → 等一下再试（页面可能刚打开）
+        if (r.sw?.step === 'no-tab') {
+          await sleep(POLL_MS);
+          continue;
+        }
         return fail(r.sw?.step ?? 'no-tab');
       }
       opened = await call('open', { exclude: opts.exclude ?? [], pick: opts.pick });
-      if (opened?.step !== 'list-not-ready') break;
+      if (opened?.step === 'not-on-tab' || opened?.step === 'list-empty') {
+        emptyTries++;
+        if (emptyTries >= 3 && Date.now() >= deadline) {
+          // 重试到上限还是空 → 真的没红点了
+          out.ok = true;
+          out.done = true;
+          out.step = 'done';
+          out.detail = '没有带红点的会话了';
+          return out;
+        }
+        await sleep(POLL_MS);
+        continue;
+      }
+      break;
     } catch (e) {
       out.step = 'timeout';
       out.reason = (e as Error).message;
@@ -258,36 +351,42 @@ export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: strin
     return fail(opened?.step ?? 'open-failed', opened?.detail);
   }
   out.name = opened.name;
+  out.clickedName = opened.name;
   out.badge = opened.badge;
-  await sleep(STEP_WAIT['open']);
 
-  // ③ 核对会话头 —— 名字对不上就停手，不点「确定」
-  const conv = await call('verify-conv');
-  const convText = String(conv?.conv ?? '');
-  if (!convText.includes(String(out.name))) {
-    return fail('conv-mismatch', convText.slice(0, 160));
+  // ③ 等会话真的打开（不靠名字比对 —— 红点只在一行上，点哪行就是哪个人）
+  const conv = await waitConvOpen();
+  if (!conv.open) {
+    // 点了但没打开 —— 不重试这个（红点可能已经消了），交给上层跳到下一个
+    out.name = conv.name || out.name;
+    out.conv = conv.text.slice(0, 200);
+    return fail('conv-not-open', conv.text.slice(0, 160));
   }
-  out.conv = convText.slice(0, 200);
+  out.conv = conv.text.slice(0, 200);
+  // 会话头上的人名才是准的（列表行里的名字可能同名）
+  if (conv.name) out.name = conv.name;
 
-  // ④ 点「发简历」
+  // ④ 点「发简历」，然后等确认弹窗**真的出现**（不猜它多久到）
   const sr = await call('send-resume');
   if (!sr?.ok) {
     return fail(sr?.step ?? 'no-resume-btn');
   }
-  await sleep(STEP_WAIT['send-resume']);
-
-  // ⑤ 核对确认弹窗
-  const cp = await call('check-panel');
-  if (!cp?.hasPanel) {
-    return fail('no-panel', String(cp?.panel ?? '').slice(0, 160));
+  const panel = await waitPanelOpen();
+  if (!panel.ready) {
+    return fail('no-panel', panel.text.slice(0, 160));
   }
+  out.panel = panel.text.slice(0, 200);
 
   // ⑥ 点「确定」—— 这一步才真的发起投递
   const cf = await call('confirm');
   if (!cf?.ok) {
     return fail(cf?.step ?? 'no-sure-btn');
   }
-  await sleep(STEP_WAIT['confirm']);
+  // 等弹窗关掉 —— 它关了才说明「确定」这一步真的走了
+  // （不等的话下一个会话可能踩在还没关的弹窗上）
+  if (!(await waitPanelClosed())) {
+    out.detail = '点了确定，但确认弹窗一直没关（可能网络卡了）';
+  }
 
   // ⑦ 回读消息 —— 服务端确认之外，页面这边也留一份现场（确认失败时有用）
   const rm = await call('read-messages');
@@ -317,35 +416,44 @@ export async function scanGreetings(): Promise<{
   let last: any = null;
   /** 第一次成功切 tab 时页面是否已在「新招呼」上 —— false = 冷启动（页面是新开的） */
   let firstAlreadyOn: boolean | null = null;
+  /** 这次切 tab 有没有真的点（点了 → 列表要去重新拉接口，要等它回来） */
+  let needsRefresh: boolean | null = null;
   const deadline = Date.now() + 30_000;
 
-  // ① 等页面就绪
+  // ① 等页面就绪 + 列表真的到货
   while (Date.now() < deadline) {
     try {
       const r = await switchAndSettle();
       if (r.ok) {
         if (firstAlreadyOn === null) firstAlreadyOn = !!r.sw.alreadyOn;
+        if (needsRefresh === null) needsRefresh = !r.sw.alreadyOn;
         last = await call('scan');
       }
-      // 「聊天界面在不在」—— 不是「有没有会话行」。
-      // 列表真的空了的时候不该一直等。
-      if (last?.ready) break;
+      // 就绪 = 聊天界面挂上了 **且**（没切 tab，或切 tab 之后的列表接口已经回来）
+      // 只看界面会漏：界面先挂上、列表后到（弱网时差好几秒）→ 误判成「没有新招呼」
+      if (last?.ready && (!needsRefresh || last?.listFresh)) break;
     } catch {
       /* ignore */
     }
-    await sleep(1500);
+    await sleep(POLL_MS);
   }
 
-  // ② 冷启动时红点可能比列表晚到（列表先渲染、红点是 MQTT 后推的）—— 复查一次。
-  //    只在冷启动做：常驻固定页上 MQTT 一直连着，列表和红点本来就是同步的，
-  //    每个空闲轮都等 3 秒再扫一遍纯属白等（30 秒轮询下占空比翻了四倍）。
+  // ② 冷启动时红点可能比列表晚到（红点是 MQTT 后推的）——
+  //    轮询到**真的出现红点**为止（不是「等 3 秒再看一眼」）。
+  //    只在冷启动做：常驻固定页上 MQTT 一直连着，列表和红点本来就是同步的。
   if (firstAlreadyOn === false && (last?.rowCount ?? 0) > 0 && !(last?.badges ?? []).length) {
-    await sleep(3000);
-    try {
-      const again = await call('scan');
-      if (again) last = again;
-    } catch {
-      /* ignore */
+    const until = Date.now() + 8000;
+    while (Date.now() < until) {
+      await sleep(POLL_MS);
+      try {
+        const again = await call('scan');
+        if (again?.badges?.length) {
+          last = again;
+          break;
+        }
+      } catch {
+        /* ignore */
+      }
     }
   }
 

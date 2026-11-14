@@ -279,11 +279,15 @@ interface RoundOpts {
 }
 
 /**
- * 最近投过（或者失败过）的会话 → 排除名单，避免重复投。
+ * 最近投过（或者失败过）的会话 —— **只用来报警，不用来拦投递**。
  *
- * 名单是 state 的投影，不单独维护 —— 记完账重新算一次就行。
+ * 投递判据是**红点**：红点 = 没人打开过这个会话，而投递必然要打开会话，
+ * 所以投过的人红点必然消失 → 红点自己就是「还没投过」的标记。
+ *
+ * 这份名单唯一的用途：万一红点在投递后没及时消失（BOSS 的已读是异步推的），
+ * 我们能看出「这个人 12 小时内投过，怎么还有红点」并提示，而不是闷头投第二遍。
  */
-function buildExclude(state: AutoState): ExcludeEntry[] {
+function recentlyHandledNames(state: AutoState): ExcludeEntry[] {
   const out: ExcludeEntry[] = [];
   const seen = new Set<string>();
   const collect = (recs: Record<string, any>) => {
@@ -332,16 +336,22 @@ async function runRound(opts: RoundOpts) {
   const client = await createBrowserClient();
   await ensureLogin(client);
 
-  // ⑤ 排除名单 —— 必须在干跑之前算出来。
-  //    干跑打印的名单必须和真投的名单一致：
-  //    之前排除名单在干跑返回**之后**才算，于是干跑会把
-  //    「12 小时内已经投过、这轮不会再投」的人一并列出来。
-  const exclude = buildExclude(state);
-  const targets = scan.badges.filter(
-    (b) => !isExcludedEntry(b, exclude) && (!opts.only || b.name === opts.only),
-  );
+  // ⑤ 本轮要投的人 = **带红点的会话**。
+  //    红点 = 没人打开过 = 还没投过（投递必然要打开会话，红点会随之消失）。
+  //    所以判据只有红点，不再有「12 小时内投过就别投」那种名单 ——
+  //    那种名单会误伤（一次偶发失败就把人挡 12 小时，同名同公司还会漏人）。
+  const targets = scan.badges.filter((b) => !opts.only || b.name === opts.only);
   for (const b of targets) {
     log(`  · ${b.name || '(读不出名字)'} [红点 ${b.badge}] ${(b.lines ?? []).join(' | ')}`);
+  }
+
+  // 12 小时内投过的人如果还有红点 → BOSS 的已读是异步推的，红点没及时消失。
+  // 提示一下，免得闷头投第二遍。
+  const handled = recentlyHandledNames(state);
+  for (const b of targets) {
+    if (isExcludedEntry(b, handled)) {
+      log(`  ⚠️ ${b.name} 12 小时内投过，却还有红点（已读推送可能滞后）—— 仍按红点投`);
+    }
   }
 
   if (opts.dryRun) {
@@ -370,12 +380,21 @@ async function runRound(opts: RoundOpts) {
   const sentList: { name: string; key: string }[] = [];
   let count = 0;
 
+  // 本轮已经试过、但没打开成功的会话 ——
+  //   只在本轮内生效：防止一轮里反复挑中同一个「点了没打开」的行。
+  //   不跨轮（跨轮就该再试一次，一次偶发失败不该把人挡到下一轮）。
+  const triedThisRound = new Set<string>();
+
   for (;;) {
-    const res = await deliverNext({ exclude: buildExclude(state), pick: opts.only });
+    const res = await deliverNext({
+      exclude: [...triedThisRound].map((name) => ({ name })),
+      pick: opts.only,
+    });
     if (res.done) {
       log('没有更多红点了');
       break;
     }
+    if (res.name) triedThisRound.add(res.name);
 
     // 去重键统一在这里算 —— 成功、失败、超时三条路径用同一个键，
     // 不然同一个人会在状态文件里落成两个键（`id:friendId` 和 `n:姓名::`）。
@@ -425,13 +444,9 @@ async function runRound(opts: RoundOpts) {
 
     count++;
     const name = res.name!;
-    if (recentlyHandled(state, key, name)) {
-      // 注意：简历**已经发出去了**（上一步点了「确定」），
-      // 这里只是「状态里已经有这条记录」，不再重复记账 —— 不是「跳过」。
-      log(`↷ ${name} 的记录里已经有了（不重复记账）`);
-      continue;
-    }
-
+    // 简历**已经发出去了**（上一步点了「确定」）—— 照实记账。
+    // 判据是红点，不是「记录里有没有」；这里只是把这次投递记进历史。
+    const hadRecord = recentlyHandled(state, key, name);
     record(state, 'sent', key, {
       name,
       job: hit?.job,
@@ -439,9 +454,13 @@ async function runRound(opts: RoundOpts) {
       status: 'sent',
     });
     sentList.push({ name, key });
+    if (hadRecord) {
+      log(`  ⚠️ ${name} 的记录里已经有（12 小时内投过）—— 这次又投了一遍，红点没及时消`);
+    }
+    const mismatch = res.clickedName && res.clickedName !== name ? `（点的是 ${res.clickedName}）` : '';
     log(
       `✅ 已投给 ${name}${hit?.job ? ' · ' + hit.job : ''}${company ? ' · ' + company : ''}` +
-        `  [会话头: ${res.conv ?? '-'}]`,
+        `${mismatch}  [会话头: ${res.conv ?? '-'}]`,
     );
 
     if (count >= ROUND_GUARD) {
