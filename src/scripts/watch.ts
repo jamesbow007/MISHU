@@ -55,6 +55,13 @@ const LOG_FILE = path.join(DATA_DIR, 'watch.log');
 const DEFAULT_INTERVAL = 300; // 秒 = 5 分钟
 /** 单轮最多投多少个 —— 防「红点一直消不掉」把进程跑飞，不是业务上限 */
 const ROUND_GUARD = 100;
+/**
+ * 服务端确认的预算（毫秒）。
+ *
+ * 这是**兜底上限**，不是「等多久就会好」——
+ * 真正的判据是「服务端回没回我这条简历」，查到了就立刻停。
+ */
+const VERIFY_BUDGET_MS = 15_000;
 
 /* ---------------- 小工具 ---------------- */
 
@@ -330,7 +337,10 @@ async function runRound(opts: RoundOpts) {
   //    而登录态探测走的是接口请求，必须在页面上下文里发 ——
   //    用户一个 zhipin 页面都没开的时候，顺序反了就会报「没有打开的标签页」。
   const scan = await scanGreetings();
-  log(`扫描：会话 ${scan.rowCount} 行，其中带红点 ${scan.badges.length} 个`);
+  log(
+    `扫描：会话 ${scan.rowCount} 行，其中带红点 ${scan.badges.length} 个` +
+      (scan.stuck ? '（页面卡住过 → 已重载恢复）' : ''),
+  );
 
   // ④ 登录态
   const client = await createBrowserClient();
@@ -389,6 +399,16 @@ async function runRound(opts: RoundOpts) {
     const res = await deliverNext({
       exclude: [...triedThisRound].map((name) => ({ name })),
       pick: opts.only,
+      // 服务端确认：用来识别「点「发简历」但没有确认弹窗、直接就发了」那种形态。
+      // 没有它就只能等弹窗，等到没弹窗就判失败 —— 明明投出去了却记成失败。
+      verify: async (name: string, sinceAt: number) => {
+        if (!client) return false;
+        try {
+          return await verifyDelivered(client, name, sessions, sinceAt);
+        } catch {
+          return false;
+        }
+      },
     });
     if (res.done) {
       log('没有更多红点了');
@@ -406,11 +426,27 @@ async function runRound(opts: RoundOpts) {
       const who = res.name || '(不知是谁)';
       log(`❌ ${who} 投递失败：${res.reason ?? res.step}  ${res.detail ?? ''}`.trimEnd());
 
-      // 结果不确定（任务超时）：可能简历已经发出去了 —— 用服务端确认来判定，
-      // 否则下一轮会重复投同一个 HR
-      if (res.uncertain && res.name) {
+      // **可能其实投出去了** —— 有两种情况：
+      //   ① uncertain：任务超时了，不知道点没点上
+      //   ② maybeSent：点了「发简历」但确认弹窗没出现（BOSS 有直接发的形态，
+      //      实测 2026-11-15 12:34 对「何女士」就是这样：简历 1 秒内就到了服务端，
+      //      而弹窗从头到尾没出现）
+      // 这两种都必须**用服务端确认**来判定，不能凭页面上没看到弹窗就判失败。
+      if ((res.uncertain || res.maybeSent) && res.name) {
         try {
-          const ok = await verifyDelivered(client, res.name, sessions);
+          // 一直查到截止时刻为止 —— **不是试几次就放弃**。
+          // 慢网下消息可能好几秒才落库，试三次就判失败是错的
+          // （跟当初 1600ms 硬等一个毛病：拿固定次数去猜状态什么时候到）。
+          // 两次查询之间等「上一次查询自己花了多久」—— 网络慢就自然等得久。
+          const until = Date.now() + VERIFY_BUDGET_MS;
+          let ok = false;
+          for (;;) {
+            const t0 = Date.now();
+            ok = await verifyDelivered(client, res.name, sessions, res.sentAt);
+            if (ok) break;
+            if (Date.now() >= until) break;
+            await sleep(Math.max(200, Date.now() - t0));
+          }
           if (ok) {
             record(state, 'sent', key, {
               name: res.name,
@@ -419,7 +455,7 @@ async function runRound(opts: RoundOpts) {
               status: 'verified',
             });
             sentList.push({ name: res.name, key });
-            log('  ↳ 超时了，但服务端确实收到了简历 —— 按已投递记账');
+            log('  ↳ 服务端确实收到了简历 —— 按已投递记账（页面没弹窗，但发出去了）');
             continue;
           }
           log('  ↳ 服务端也没查到简历，按失败记账');

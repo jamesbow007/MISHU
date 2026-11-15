@@ -17,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { BossClient } from './client.js';
-import { runPageFn } from './page-transport.js';
+import { runPageFnFull, reloadTab } from './page-transport.js';
 import {
   isResumeMessage,
   listMessages,
@@ -158,6 +158,15 @@ export interface DeliverOutcome {
    * 这种要用服务端确认来判定，不能当成失败重投。
    */
   uncertain?: boolean;
+  /**
+   * **可能已经投出去了**（点了「发简历」但确认弹窗没出现）。
+   *
+   * BOSS 有两种投递形态：弹确认框让你点「确定」；或者**直接就发了**。
+   * 后者没有弹窗可等 —— 只能靠服务端确认来判断到底成没成。
+   */
+  maybeSent?: boolean;
+  /** 点了「发简历」的时刻（服务端确认的时间下界） */
+  sentAt?: number;
   /** 失败时的建议文案 */
   reason?: string;
 }
@@ -170,7 +179,8 @@ const STEP_REASON: Record<string, string> = {
   'row-missing': '会话行在点击前消失了',
   'conv-not-open': '点了会话但它没打开（页面可能还没准备好）',
   'no-resume-btn': '聊天工具栏里没有「发简历」按钮（对方可能不支持）',
-  'no-panel': '没弹出简历确认框',
+  'not-seen': '点了「发简历」，但会话里一直没出现附件简历',
+  'not-seen-after-confirm': '点了确定，但会话里一直没出现附件简历',
   'no-sure-btn': '弹窗里找不到「确定」按钮',
   'unknown-mode': '未知的页面任务模式',
 };
@@ -189,9 +199,19 @@ const TIMEOUT_CONV_OPEN = 15_000;
 const TIMEOUT_PANEL = 12_000;
 const TIMEOUT_LIST = 20_000;
 
+/**
+ * 当前用的那个标签页（守护进程固定的那个）。
+ *
+ * 记它是为了「页面卡住了要重载」时知道重载谁 —— 页面里拿不到自己的 tabId，
+ * 只能从扩展回传的结果里拿。
+ */
+let currentTabId: number | null = null;
+
 /** 调一次页面函数（url / 超时都用 runPageFn 的默认值，这里只给守恒进程专属的两项） */
 async function call(mode: string, extra: Record<string, any> = {}): Promise<any> {
-  return runPageFn('greeting', { mode, ...extra }, { pin: true, own: true });
+  const r = await runPageFnFull('greeting', { mode, ...extra }, { pin: true, own: true });
+  if (r.tabId) currentTabId = r.tabId;
+  return r.data;
 }
 
 /**
@@ -214,23 +234,6 @@ async function waitConvOpen(): Promise<{ open: boolean; name: string; text: stri
       if (last.open) return last;
     } catch {
       /* 页面还没准备好 → 继续等 */
-    }
-    if (Date.now() >= deadline) return last;
-    await sleep(POLL_MS);
-  }
-}
-
-/** 等简历确认弹窗出现（并且内容是「发送简历」） */
-async function waitPanelOpen(): Promise<{ ready: boolean; text: string }> {
-  const deadline = Date.now() + TIMEOUT_PANEL;
-  let last = { ready: false, text: '' };
-  for (;;) {
-    try {
-      const p = await call('check-panel');
-      last = { ready: !!p?.ready, text: String(p?.panel ?? '') };
-      if (last.ready) return last;
-    } catch {
-      /* 继续等 */
     }
     if (Date.now() >= deadline) return last;
     await sleep(POLL_MS);
@@ -282,7 +285,21 @@ async function switchAndSettle(): Promise<{ ok: boolean; sw: any }> {
  * 没有认错的余地；拿名字卡反而会误伤（实测一晚上 5 个招呼一个没投出去）。
  * 只等「会话真的打开了」这个事实。
  */
-export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: string } = {}): Promise<DeliverOutcome> {
+export async function deliverNext(
+  opts: {
+    exclude?: ExcludeEntry[];
+    pick?: string;
+    /**
+     * 服务端确认：这个 HR 的会话里到底有没有简历。
+     *
+     * 用来识别「点「发简历」但没有确认弹窗、直接就发了」那种形态 ——
+     * 没有它就只能干等弹窗，最后把成功的投递误判成失败。
+     *
+     * sinceAt 是点了「发简历」的时刻 —— 只认那之后出现的简历消息。
+     */
+    verify?: (name: string, sinceAt: number) => Promise<boolean>;
+  } = {},
+): Promise<DeliverOutcome> {
   const out: DeliverOutcome = { ok: false };
 
   /** 失败收口：六个失败分支原来各写一遍这三行 */
@@ -366,34 +383,74 @@ export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: strin
   // 会话头上的人名才是准的（列表行里的名字可能同名）
   if (conv.name) out.name = conv.name;
 
-  // ④ 点「发简历」，然后等确认弹窗**真的出现**（不猜它多久到）
+  // ④ 点「发简历」，然后等「投递真的发生了」
+  //
+  //    BOSS 有两种投递形态：
+  //      A. 弹确认框 → 点「确定」才真的发
+  //      B. **直接就发了**，没有弹窗（实测 2026-11-15 12:34 对「何女士（SHEIN）」）
+  //
+  //    两种形态的**共同结果**是：会话里出现「附件简历」消息。
+  //    所以判据取这个**页面状态**，而不是「弹窗出来没有」——
+  //    既不用猜弹窗，也不会把「弹窗没出现但投出去了」误判成失败。
+  //
+  //    ⚠️ 等待期间只做「读状态」和「点确定」，不按固定时长猜什么该发生。
   const sr = await call('send-resume');
   if (!sr?.ok) {
     return fail(sr?.step ?? 'no-resume-btn');
   }
-  const panel = await waitPanelOpen();
-  if (!panel.ready) {
-    return fail('no-panel', panel.text.slice(0, 160));
-  }
-  out.panel = panel.text.slice(0, 200);
+  // 点了「发简历」的时刻 —— 服务端确认时用它当时间下界
+  // （只认这之后出现的简历消息，免得 HR 自己发过附件简历被误判）
+  out.sentAt = Date.now();
 
-  // ⑥ 点「确定」—— 这一步才真的发起投递
-  const cf = await call('confirm');
-  if (!cf?.ok) {
-    return fail(cf?.step ?? 'no-sure-btn');
-  }
-  // 等弹窗关掉 —— 它关了才说明「确定」这一步真的走了
-  // （不等的话下一个会话可能踩在还没关的弹窗上）
-  if (!(await waitPanelClosed())) {
-    out.detail = '点了确定，但确认弹窗一直没关（可能网络卡了）';
+  const sendDeadline = Date.now() + TIMEOUT_PANEL;
+  let confirmed = false;
+  let delivered = false;
+  let panelText = '';
+  for (;;) {
+    // ① 确认框出现了？→ 点「确定」（形态 A）
+    if (!confirmed) {
+      try {
+        const p = await call('check-panel');
+        if (p?.hasPanel) {
+          panelText = String(p?.panel ?? '');
+          const cf = await call('confirm');
+          if (cf?.ok) {
+            confirmed = true;
+            out.panel = panelText.slice(0, 200);
+          }
+        }
+      } catch {
+        /* 页面没准备好 → 继续等 */
+      }
+    }
+
+    // ② 会话里出现「附件简历」？→ 投递真的发生了（A/B 两种形态都适用）
+    try {
+      const d = await call('check-resume-sent');
+      if (d?.delivered) {
+        delivered = true;
+        out.messages = d?.messages ?? [];
+        break;
+      }
+    } catch {
+      /* 页面没准备好 → 继续等 */
+    }
+
+    if (Date.now() >= sendDeadline) break;
+    await sleep(POLL_MS);
   }
 
-  // ⑦ 回读消息 —— 服务端确认之外，页面这边也留一份现场（确认失败时有用）
-  const rm = await call('read-messages');
-  out.messages = rm?.messages ?? [];
-  out.ok = true;
-  out.step = 'sent';
-  return out;
+  if (delivered) {
+    out.ok = true;
+    out.step = 'sent';
+    out.detail = confirmed ? '弹窗确认后投递成功' : '没有确认框，直接投递成功';
+    return out;
+  }
+
+  // 到这一步页面上还没看到简历 —— 可能只是慢。
+  // 交给上层用服务端确认兜底（那边会一直查到截止时刻，不是试几次就放弃）。
+  out.maybeSent = true;
+  return fail(confirmed ? 'not-seen-after-confirm' : 'not-seen', panelText.slice(0, 160));
 }
 
 /**
@@ -412,6 +469,8 @@ export async function deliverNext(opts: { exclude?: ExcludeEntry[]; pick?: strin
 export async function scanGreetings(): Promise<{
   rowCount: number;
   badges: { idx: number; badge: number; name: string; lines: string[]; text: string }[];
+  /** 页面是不是卡住了（列表请求压根没发出去）—— 守护进程据此重载页面 */
+  stuck?: boolean;
 }> {
   let last: any = null;
   /** 第一次成功切 tab 时页面是否已在「新招呼」上 —— false = 冷启动（页面是新开的） */
@@ -438,7 +497,24 @@ export async function scanGreetings(): Promise<{
     await sleep(POLL_MS);
   }
 
-  // ② 冷启动时红点可能比列表晚到（红点是 MQTT 后推的）——
+  // ② **页面卡住了？** —— 「0 行」有两种完全不同的含义：
+  //    a) 新招呼 tab 真的没有会话（正常）
+  //    b) 页面压根没发出列表请求，卡在初始化之前（后台标签页被限流时会这样）
+  //    判据是**有没有发过列表请求**（performance 里的 geekFilterByLabel），
+  //    不是靠等多久来猜。b) 的表现是守护进程一直扫 0 行、静默停摆。
+  const stuck = (last?.rowCount ?? 0) === 0 && last?.listRequested === false;
+  if (stuck) {
+    // 重载页面 → 初始化重跑一遍 → 再扫
+    await reloadTab(currentTabId ?? 0).catch(() => {});
+    await sleep(1500);
+    try {
+      last = await call('scan');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ③ 冷启动时红点可能比列表晚到（红点是 MQTT 后推的）——
   //    轮询到**真的出现红点**为止（不是「等 3 秒再看一眼」）。
   //    只在冷启动做：常驻固定页上 MQTT 一直连着，列表和红点本来就是同步的。
   if (firstAlreadyOn === false && (last?.rowCount ?? 0) > 0 && !(last?.badges ?? []).length) {
@@ -460,6 +536,7 @@ export async function scanGreetings(): Promise<{
   return {
     rowCount: last?.rowCount ?? 0,
     badges: last?.badges ?? [],
+    stuck,
   };
 }
 
@@ -496,18 +573,26 @@ export async function fetchSessions(client: BossClient): Promise<ChatSession[]> 
  * 判据见 messages.ts 的 isResumeMessage（手动投递脚本和守护进程共用一份，
  * 两边的「算不算投出去了」必须一致）。
  * 同名 HR 会挨个查 —— 只要有一个命中就算数。
+ *
+ * sinceAt：**只认这个时刻之后的消息**。
+ *   没有它会误判 —— 有些 HR 自己会发附件简历，那也是「简历类消息」，
+ *   但不是我们投的。加上时间下界，只认「我们点了发简历之后」出现的。
  */
 export async function verifyDelivered(
   client: BossClient,
   name: string,
   sessions?: ChatSession[],
+  sinceAt?: number,
 ): Promise<boolean> {
   const list = sessions ?? (await listSessions(client, { labelId: 0, enrich: 'none' }));
   const cands = list.filter((s) => s.name === name);
   for (const s of cands) {
     try {
       const msgs = await listMessages(client, s, { limit: 10 });
-      if (msgs.some(isResumeMessage)) return true;
+      const fresh = sinceAt
+        ? msgs.filter((m) => (m.time ?? 0) >= sinceAt - 5000)
+        : msgs;
+      if (fresh.some(isResumeMessage)) return true;
     } catch {
       /* ignore */
     }

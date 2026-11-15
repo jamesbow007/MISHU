@@ -23,7 +23,8 @@
     "watch": "tsx src/scripts/watch.ts",
     "watch:bg": "tsx src/scripts/watch.ts --bg",
     "watch:stop": "tsx src/scripts/watch.ts --stop",
-    "watch:status": "tsx src/scripts/watch.ts --status"
+    "watch:status": "tsx src/scripts/watch.ts --status",
+    "greet": "tsx src/scripts/greet.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

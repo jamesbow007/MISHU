@@ -337,6 +337,25 @@ async function dispatch(data) {
   if (data.kind === 'tab-release') return releasePinnedTab(data.taskId);
   if (data.kind === 'tabs') return tabsTask(data.taskId, listTabsData);
   if (data.kind === 'tabs-close') return tabsTask(data.taskId, () => closeLeakedTabsData(data.task));
+  // 关掉指定的几个标签页（主动打招呼流程自己开的标签页，用完要收掉）
+  if (data.kind === 'tab-close') {
+    return tabsTask(data.taskId, async () => {
+      const ids = (data.task?.tabIds ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (!ids.length) return { closed: 0 };
+      await chrome.tabs.remove(ids).catch(() => {});
+      return { closed: ids.length };
+    });
+  }
+  // 重载标签页 —— 用来救「页面卡住、列表加载不出来」的标签页
+  // （后台标签页被 Chrome 限流/冻结时，重载能让它把初始化重跑一遍）
+  if (data.kind === 'tab-reload') {
+    return tabsTask(data.taskId, async () => {
+      const id = Number(data.task?.tabId);
+      if (!id) return { reloaded: false };
+      await chrome.tabs.reload(id).catch(() => {});
+      return { reloaded: true, tabId: id };
+    });
+  }
   if (data.kind === 'cookies') {
     const cookies = await collectCookies();
     return postCookies(data.taskId, cookies);
@@ -392,8 +411,27 @@ async function runPageTask(taskId, task) {
   let fromUser = false; // 复用「用户自己正在看的」标签页 —— 绝对不能被关掉
   let createdWindowId = null; // 自己建的窗口 → 收尾时连窗口一起关
   try {
+    // ⓪ 指定标签页：直接在那个标签页里操作，不开新的也不复用别的。
+    //    「点立即沟通」可能会开出一个新标签页（聊天页在那儿），
+    //    往那个标签页里发消息就得指明是哪个 —— tabId 就是干这个的。
+    if (task.tabId) {
+      try {
+        const t = await chrome.tabs.get(task.tabId);
+        if (t) {
+          tab = t;
+          reused = true; // 不是我们开的，不能关
+        } else {
+          send({ ok: false, error: '标签页不在了：' + task.tabId });
+          return;
+        }
+      } catch (e) {
+        send({ ok: false, error: '标签页不在了：' + task.tabId });
+        return;
+      }
+    }
+
     // ① 固定标签页优先：省掉页面加载时间，也让 MQTT 连接常驻
-    if (task.type === 'dom') {
+    if (!tab && task.type === 'dom') {
       const pin = await loadPin();
       if (pin?.tabId) {
         try {
@@ -472,7 +510,9 @@ async function runPageTask(taskId, task) {
           func: fn,
           args: [arg],
         });
-        send({ ok: true, data: out?.[0]?.result ?? null });
+        // 把 tabId 一起报回去 —— 「点立即沟通」可能开新标签页，
+        // 调用方得知道去哪个标签页里发消息
+        send({ ok: true, data: out?.[0]?.result ?? null, tabId: tab.id ?? null });
       } catch (e) {
         send({ ok: false, error: 'DOM 操作失败：' + String((e && e.message) || e) });
       }
@@ -501,8 +541,8 @@ async function runPageTask(taskId, task) {
   } catch (e) {
     send({ ok: false, error: String((e && e.message) || e) });
   } finally {
-    // 固定标签页不能关（守护进程还要用）
-    const closedTab = tab && tab.id && !reused && !task.pin;
+    // 固定标签页不能关（守护进程还要用）；task.keep = 留着别关（调用方自己管）
+    const closedTab = tab && tab.id && !reused && !task.pin && !task.keep;
     if (closedTab) chrome.tabs.remove(tab.id).catch(() => {});
     // 自己建的窗口，标签页关掉后窗口也关掉（别留空窗口壳）。
     // 标签页被固定住时不能关窗口 —— 关窗口等于把固定页一起关掉。
@@ -817,7 +857,534 @@ async function domProbe(probe) {
  */
 function getPageFn(name) {
   if (name === 'greeting') return pageGreetingTask;
+  if (name === 'jobs') return pageJobsTask;
+  if (name === 'resume') return pageResumeTask;
+  if (name === 'chat') return pageChatTask;
+  if (name === 'detail') return pageDetailTask;
+  if (name === 'greet') return pageGreetTask;
   return null;
+}
+
+/**
+ * 「打招呼」弹窗任务 —— 点「立即沟通」之后弹出来的那个。
+ *
+ * 结构（实测）：
+ *   BODY.dialog-open            ← 弹窗打开时 body 上加这个 class
+ *   UL.message > LI > SPAN.text ← 招呼语模板（BOSS 里存的那几条）
+ *   DIV.send-message「发送」     ← 初始带 .disable
+ *
+ * 模式（arg.mode）：
+ *   state   弹窗开了没？发送按钮解禁没？有哪些模板？有没有输入框？
+ *   type    把 arg.text 写进自定义输入框
+ *   send    点「发送」
+ *   dump    弹窗容器的原始 HTML（排查用）
+ */
+function pageGreetTask(arg) {
+  const A = arg || {};
+  const mode = A.mode || 'state';
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
+  const out = { mode, ok: false, step: mode, at: Date.now() };
+
+  const sendBtn = () =>
+    Array.from(document.querySelectorAll('.send-message, [class*="send-message"]')).filter(visible)[0] ||
+    null;
+
+  /** 弹窗容器：从发送按钮往上找带 dialog/modal/greet/chat 的祖先 */
+  const dialogEl = () => {
+    const b = sendBtn() || document.querySelector('ul.message');
+    let p = b;
+    for (let i = 0; i < 6 && p && p !== document.body; i++) {
+      if (/dialog|modal|greet|chat|popup/i.test(String(p.className || ''))) return p;
+      p = p.parentElement;
+    }
+    return null;
+  };
+
+  if (mode === 'state') {
+    out.dialogOpen = /dialog-open/.test(String(document.body.className || ''));
+    const btn = sendBtn();
+    out.hasSend = !!btn;
+    out.sendText = txt(btn);
+    out.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
+    // 招呼语模板
+    out.templates = Array.from(document.querySelectorAll('ul.message > li'))
+      .map((li) => txt(li))
+      .filter(Boolean);
+    // 可见的输入框（自定义招呼语）
+    out.inputs = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]'))
+      .filter(visible)
+      .map((el) => ({
+        tag: el.tagName,
+        cls: String(el.className || ''),
+        placeholder: String(el.getAttribute('placeholder') || ''),
+        value: String(el.value ?? ''),
+        maxlength: Number(el.getAttribute('maxlength') || 0),
+      }));
+    out.url = location.href;
+    out.ok = true;
+    return out;
+  }
+
+  if (mode === 'dump') {
+    const d = dialogEl();
+    out.html = d ? d.outerHTML.slice(0, 6000) : '(没找到弹窗容器)';
+    out.ok = true;
+    return out;
+  }
+
+  if (mode === 'type') {
+    // 优先用弹窗里那个 textarea.input-area（自定义打招呼语）——
+    // 页面上还有搜索框等别的 input，别写错地方
+    const el =
+      document.querySelector('textarea.input-area') ||
+      Array.from(document.querySelectorAll('textarea')).filter(visible)[0] ||
+      Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible)[0] ||
+      null;
+    if (!el) {
+      out.ok = false;
+      out.step = 'no-input';
+      return out;
+    }
+    const text = String(A.text ?? '');
+    try {
+      const proto = Object.getPrototypeOf(el);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(el, text);
+    } catch (e) {
+      el.value = text;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    out.ok = true;
+    out.step = 'typed';
+    out.value = String(el.value ?? '');
+    out.used = el.tagName + '.' + String(el.className || '');
+    const btn = sendBtn();
+    out.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
+    return out;
+  }
+
+  if (mode === 'send') {
+    const btn = sendBtn();
+    if (!btn) {
+      out.ok = false;
+      out.step = 'no-send';
+      return out;
+    }
+    if (/disable/i.test(String(btn.className || ''))) {
+      out.ok = false;
+      out.step = 'still-disabled';
+      return out;
+    }
+    btn.click();
+    out.ok = true;
+    out.step = 'sent';
+    return out;
+  }
+
+  out.ok = false;
+  out.step = 'unknown-mode';
+  return out;
+}
+
+/**
+ * 「岗位详情页」任务 —— /job_detail/<encryptJobId>.html
+ *
+ * 为什么走详情页而不是职位列表：
+ *   列表页的 DOM 里只有**推荐区**那十几个卡片，
+ *   搜索接口拿到的岗位根本不在那一页里（实测：点「立即沟通」找不到这个岗位）。
+ *   详情页对**任何来源**的岗位都能直接打开，是唯一通用的入口。
+ *
+ * 模式（arg.mode）：
+ *   scan       读岗位名/薪资/HR/「立即沟通」按钮
+ *   chat-click 点「立即沟通」（异步点 —— 点了会跳转到消息页，
+ *              同步点会让 executeScript 的执行上下文被销毁，结果就丢了）
+ */
+function pageDetailTask(arg) {
+  const A = arg || {};
+  const mode = A.mode || 'scan';
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
+  const out = { mode, ok: false, step: mode, at: Date.now() };
+
+  /** 「立即沟通」按钮：页面里有两个（一个在顶部、一个在吸顶小条里），要挑**可见的**那个 */
+  const chatBtn = () => {
+    const list = Array.from(document.querySelectorAll('a.btn-startchat')).filter(visible);
+    return list[0] || null;
+  };
+
+  if (mode === 'scan' || mode === 'chat-click') {
+    const banner = document.querySelector('.job-banner');
+    const btn = chatBtn();
+    out.name = txt(banner && banner.querySelector('.name, .job-name'));
+    out.salary = txt(banner && banner.querySelector('.salary'));
+    out.city = txt(banner && banner.querySelector('.location, .text-city'));
+    out.hasBtn = !!btn;
+    out.btnKa = btn ? String(btn.getAttribute('ka') || '') : '';
+    // 按钮文案决定走哪条路：
+    //   「立即沟通」→ 还没聊过 → 点了弹「打招呼」弹窗
+    //   「继续沟通」→ 已经聊过 → 点了直接进聊天页
+    out.btnText = txt(btn);
+    out.alreadyTalked = /继续沟通/.test(out.btnText);
+    // 点完会跳到哪 —— 消息页的地址在按钮上写着
+    out.redirectUrl = btn ? String(btn.getAttribute('redirect-url') || '') : '';
+    out.url = location.href;
+
+    if (mode === 'scan') {
+      out.ok = true;
+      out.step = 'scan';
+      return out;
+    }
+
+    if (!btn) {
+      out.ok = false;
+      out.step = 'no-chat-btn';
+      return out;
+    }
+    try {
+      setTimeout(() => {
+        try { btn.click(); } catch (e) { /* ignore */ }
+      }, 0);
+    } catch (e) {
+      /* ignore */
+    }
+    out.ok = true;
+    out.step = 'chat-clicked';
+    return out;
+  }
+
+  out.ok = false;
+  out.step = 'unknown-mode';
+  return out;
+}
+
+/**
+ * 「聊天」页任务 —— 主动打招呼的发消息那一步。
+ *
+ * 页面：/web/geek/chat（也可能是点「立即沟通」后弹出来的聊天面板）
+ *
+ * 模式（arg.mode）：
+ *   state    我在哪？聊天面板开了没？输入框在不在？提交按钮解禁了没？
+ *   type     把 arg.text 写进输入框
+ *   submit   点「提交」
+ *
+ * ⚠️ **页面侧不许等待**：所有 sleep 放 Node 侧（后台标签页的定时器会被限流/冻结）。
+ */
+function pageChatTask(arg) {
+  const A = arg || {};
+  const mode = A.mode || 'state';
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const out = { mode, ok: false, step: mode, at: Date.now() };
+
+  /** 输入框（聊天页的输入框在 .input-box 里；简历弹窗里也有 .btn-sure-v2，别搞混） */
+  const inputBox = () => document.querySelector('.input-box');
+  const textarea = () => document.querySelector('.input-box textarea.input, textarea.input');
+  const submitBtn = () => document.querySelector('.input-box .btn-sure-v2, .input-box .btn-v2');
+  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
+
+  if (mode === 'state') {
+    out.url = location.href;
+    const ta = textarea();
+    const btn = submitBtn();
+    out.hasInput = !!ta;
+    out.hasBox = !!inputBox();
+    // ⚠️ **可见性很关键**：消息页没打开会话时，输入框在 DOM 里但**是隐藏的**
+    //    （那时候往里写字是白写 —— 消息根本没地方发）。
+    out.boxVisible = !!(inputBox() && visible(inputBox()));
+    out.value = ta ? String(ta.value || '') : '';
+    out.submitExists = !!btn;
+    // 提交按钮是「有内容才解禁」的 —— 解禁了才能点
+    out.submitReady = !!btn && visible(btn) && !/disabled/.test(String(btn.className || ''));
+    // 当前会话是谁
+    const head = document.querySelector('.chat-conversation .name-text, .top-info-content .name-text');
+    out.convName = txt(head);
+    // 最近几条消息（确认发出去了没有）
+    const items = document.querySelectorAll('.im-list .message-item');
+    const msgs = [];
+    for (let i = Math.max(0, items.length - 5); i < items.length; i++) msgs.push(txt(items[i]).slice(0, 80));
+    out.messages = msgs;
+    out.messageCount = items.length;
+    out.ok = true;
+    out.step = 'state';
+    return out;
+  }
+
+  if (mode === 'type') {
+    const ta = textarea();
+    if (!ta || !visible(ta)) {
+      out.ok = false;
+      out.step = 'no-input';
+      out.detail = ta ? '输入框在，但不可见（会话没打开）' : '没有输入框';
+      return out;
+    }
+    const text = String(A.text ?? '');
+    // Vue 的 v-model 靠 input 事件同步 —— 直接改 .value 它不知道，
+    // 所以要走原生 setter 再派发 input/change（改 value 这个动作本身是「伪造」的）
+    try {
+      const proto = Object.getPrototypeOf(ta);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(ta, text);
+    } catch (e) {
+      ta.value = text;
+    }
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.dispatchEvent(new Event('change', { bubbles: true }));
+    out.ok = true;
+    out.step = 'typed';
+    out.value = String(ta.value || '');
+    const btn = submitBtn();
+    out.submitReady = !!btn && !/disabled/.test(String(btn.className || ''));
+    return out;
+  }
+
+  if (mode === 'submit') {
+    const btn = submitBtn();
+    if (!btn) {
+      out.ok = false;
+      out.step = 'no-submit';
+      return out;
+    }
+    if (/disabled/.test(String(btn.className || ''))) {
+      out.ok = false;
+      out.step = 'still-disabled';
+      return out;
+    }
+    btn.click();
+    out.ok = true;
+    out.step = 'submitted';
+    return out;
+  }
+
+  out.ok = false;
+  out.step = 'unknown-mode';
+  return out;
+}
+
+/**
+ * 「职位」页任务 —— 主动投递用。
+ *
+ * 页面：/web/geek/jobs?ka=header-jobs
+ *   左侧 .job-card-wrap 卡片列表，右侧 .job-detail-container 是选中卡片的详情（JD + 立即沟通）
+ *
+ * 模式（arg.mode）：
+ *   scan      读卡片列表 + 当前选中卡片的 JD / HR / 「立即沟通」按钮
+ *   pick      按 jobId 点开对应卡片（点完右侧 JD 才会换成它）
+ *   requests  读最近发出去的接口请求 URL —— 用来还原页面真实的查询参数
+ *
+ * ⚠️ 同样**页面侧不许等待**：等渲染由 Node 侧控制。
+ */
+function pageJobsTask(arg) {
+  const A = arg || {};
+  const mode = A.mode || 'scan';
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const out = { mode, ok: false, step: mode, at: Date.now() };
+
+  /** 左侧卡片列表 */
+  const readCards = () => {
+    const els = Array.from(document.querySelectorAll('.job-card-wrap'));
+    return els.map((el, idx) => {
+      const nameEl = el.querySelector('.job-name');
+      const salEl = el.querySelector('.job-salary');
+      const href = nameEl ? String(nameEl.getAttribute('href') || '') : '';
+      const m = href.match(/job_detail\/([A-Za-z0-9_-]+)\.html/);
+      const foot = el.querySelector('.job-card-footer');
+      return {
+        idx,
+        jobId: m ? m[1] : '',
+        name: txt(nameEl),
+        salary: txt(salEl),
+        tags: Array.from(el.querySelectorAll('.tag-list li')).map(txt),
+        company: txt(foot && foot.querySelector('.boss-name')),
+        location: txt(foot && foot.querySelector('.company-location')),
+        active: /(^|\s)active(\s|$)/.test(String(el.className || '')),
+        href,
+      };
+    });
+  };
+
+  /** 右侧详情面板 */
+  const readDetail = () => {
+    const panel = document.querySelector('.job-detail-container');
+    if (!panel) return { present: false };
+    const chatBtn = panel.querySelector('a.op-btn.op-btn-chat');
+    // JD 正文：面板里有好几个候选容器，取正文最长的那个
+    const cands = Array.from(
+      panel.querySelectorAll('[class*="desc"], [class*="job-sec"], [class*="text"], [class*="content"]'),
+    )
+      .map((e) => txt(e))
+      .filter((t) => t.length > 30);
+    cands.sort((a, b) => b.length - a.length);
+    // HR 名字：「陈先生」「申女士」这种
+    const all = txt(panel);
+    const hrMatch = all.match(/([一-龥]{1,4}(先生|女士|老师))/);
+    return {
+      present: true,
+      name: txt(panel.querySelector('.job-name')),
+      salary: txt(panel.querySelector('.job-salary')),
+      jd: (cands[0] || '').slice(0, 4000),
+      jdLen: (cands[0] || '').length,
+      hr: hrMatch ? hrMatch[1] : '',
+      chatBtn: !!chatBtn,
+      chatBtnKa: chatBtn ? String(chatBtn.getAttribute('ka') || '') : '',
+      chatBtnText: txt(chatBtn),
+    };
+  };
+
+  if (mode === 'scan') {
+    const cards = readCards();
+    out.cards = cards;
+    out.cardCount = cards.length;
+    out.detail = readDetail();
+    out.ok = true;
+    out.step = 'scan';
+    return out;
+  }
+
+  if (mode === 'pick') {
+    const want = String(A.jobId || '');
+    const cards = readCards();
+    const hit = cards.find((c) => c.jobId && c.jobId === want);
+    if (!hit) {
+      out.ok = false;
+      out.step = 'no-card';
+      out.detail = '列表里没有这个岗位：' + want;
+      return out;
+    }
+    const el = document.querySelectorAll('.job-card-wrap')[hit.idx];
+    const target = el.querySelector('.job-name') || el;
+    target.click();
+    out.ok = true;
+    out.step = 'picked';
+    out.jobId = hit.jobId;
+    out.name = hit.name;
+    return out;
+  }
+
+  if (mode === 'chat-click') {
+    // 点「立即沟通」。
+    //
+    // ⚠️ **必须异步点**：点了之后页面可能跳转（执行上下文被销毁 → executeScript
+    // 报 "Execution context was destroyed"，结果就丢了）。所以用 setTimeout(0)
+    // 把点击推迟到本次脚本返回**之后**，再由 Node 侧去查「聊跑到哪去了」。
+    const btn = document.querySelector('a.op-btn.op-btn-chat');
+    if (!btn) {
+      out.ok = false;
+      out.step = 'no-chat-btn';
+      return out;
+    }
+    const ka = String(btn.getAttribute('ka') || '');
+    const m = ka.match(/chat_([A-Za-z0-9_-]+)/);
+    out.ka = ka;
+    out.jobId = m ? m[1] : '';
+    out.name = txt(document.querySelector('.job-detail-container .job-name'));
+    out.beforeUrl = location.href;
+    out.chatBtnText = txt(btn);
+    try {
+      setTimeout(() => {
+        try { btn.click(); } catch (e) { /* ignore */ }
+      }, 0);
+    } catch (e) {
+      /* ignore */
+    }
+    out.ok = true;
+    out.step = 'chat-clicked';
+    return out;
+  }
+
+  if (mode === 'requests') {
+    // 页面真实发出去的接口 —— 拿来还原查询参数，不靠猜
+    const urls = [];
+    try {
+      for (const e of performance.getEntriesByType('resource')) {
+        const n = String(e.name || '');
+        if (n.includes('/wapi/') || n.includes('/api/')) urls.push(n);
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    out.ok = true;
+    out.step = 'requests';
+    out.urls = urls.slice(-40);
+    return out;
+  }
+
+  out.ok = false;
+  out.step = 'unknown-mode';
+  return out;
+}
+
+/**
+ * 「我的在线简历」任务 —— /web/geek/resume
+ *
+ * 返回分块的内容（每一块 = 简历的一个模块），够喂给大模型了。
+ * 不去抠每一个子选择器 —— 简历页结构一改就废，而「分块的原文」对模型来说信息是全的。
+ */
+function pageResumeTask(arg) {
+  const A = arg || {};
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const out = { mode: A.mode || 'read', ok: false, step: 'read', at: Date.now() };
+
+  // 个人信息那一栏：图标 span 里带值（<i class="fz-resume fz-experience"></i>4年经验）
+  const info = {};
+  try {
+    const box = document.querySelector('.info-flex-item');
+    if (box) {
+      const spans = Array.from(box.querySelectorAll('span'));
+      for (const s of spans) {
+        const icon = s.querySelector('i');
+        const cls = icon ? String(icon.className || '') : '';
+        const v = txt(s).replace(txt(icon), '').trim();
+        if (!v) continue;
+        if (/fz-experience/.test(cls)) info.experience = v;
+        else if (/fz-degree/.test(cls)) info.degree = v;
+        else if (/fz-status/.test(cls)) info.status = v;
+        else if (/fz-tel/.test(cls)) info.phone = v;
+        else if (/fz-mail/.test(cls)) info.email = v;
+        else if (/fz-weixin/.test(cls)) info.weixin = v;
+      }
+      // 姓名：整块文本里的第一段
+      const all = txt(box);
+      const nm = all.match(/^([一-龥]{2,4})\s/);
+      if (nm) info.name = nm[1];
+    }
+  } catch (e) {
+    /* ignore */
+  }
+
+  // 每个简历模块一块
+  const blocks = [];
+  try {
+    for (const el of Array.from(document.querySelectorAll('.resume-item'))) {
+      const h = el.querySelector('h3.title, .title');
+      const title = txt(h).replace(/编辑|预览/g, '').trim();
+      const body = txt(el).replace(txt(h), '').trim();
+      if (!body) continue;
+      blocks.push({ id: el.id || '', title, text: body.slice(0, 4000) });
+    }
+  } catch (e) {
+    /* ignore */
+  }
+
+  // 期望职位：单独再抓一份（它在「期望职位」模块里，但要拆成「职位/城市/薪资」才好用）
+  const expects = [];
+  try {
+    const exp = document.querySelector('#expectList, [id*="expect"]');
+    if (exp) {
+      for (const li of Array.from(exp.querySelectorAll('li'))) {
+        const t = txt(li);
+        if (t) expects.push(t);
+      }
+    }
+  } catch (e) {
+    /* ignore */
+  }
+
+  out.info = info;
+  out.blocks = blocks;
+  out.expects = expects;
+  out.ok = true;
+  return out;
 }
 
 /**
@@ -1163,6 +1730,21 @@ function pageGreetingTask(arg) {
     // 当前选中的是不是「新招呼」—— 切 tab 后列表要重新拉，
     // 这中间读到的可能是上一个 tab 的旧列表。Node 侧靠这个判断该不该等。
     out.onNewTab = isOnNewTab();
+    // 页面**有没有真的去要过会话列表**。
+    //
+    // 为什么要这个：后台标签页有时会把页面卡在初始化之前 ——
+    // 列表请求压根没发出去（实测：performance 里一个 resource 都没有），
+    // 页面就一直显示「30天内暂无联系人」。
+    // 这种情况下「0 行」不是「没有新招呼」，是**页面坏了**。
+    // 判据就是「有没有发过列表请求」，比猜时间可靠。
+    out.listRequested = false;
+    try {
+      out.listRequested = performance
+        .getEntriesByType('resource')
+        .some((e) => String(e.name || '').includes('geekFilterByLabel'));
+    } catch (e) {
+      out.listRequested = true; // 读不到就当它正常
+    }
     // 切 tab 之后列表是**重新拉接口**才有的。
     //   界面挂上了 ≠ 列表到货 —— 冷启动时这两件事差着一次网络往返。
     //   用「切 tab 之后有没有发出过列表请求」这个事实来判断，别猜时间。
@@ -1268,6 +1850,31 @@ function pageGreetingTask(arg) {
     return out;
   }
 
+  if (mode === 'open-by-name') {
+    // 在**当前显示的 tab** 里按名字点开一行。
+    //
+    // 为什么不能复用 open 模式：那个只在「新招呼」tab 里找，
+    // 而要复查的会话（比如已经投过的）早就离开新招呼 tab 了。
+    const want = String(A.name ?? '');
+    const rows = Array.from(document.querySelectorAll('.friend-content'));
+    const hit = rows.find((r) => {
+      const n = r.querySelector('.name-text');
+      return n && txt(n) === want;
+    });
+    if (!hit) {
+      out.ok = false;
+      out.step = 'no-row';
+      out.detail = '当前列表里没有「' + want + '」这一行（可见 ' + rows.length + ' 行）';
+      return out;
+    }
+    const el = hit.querySelector('.name-text') || hit;
+    el.click();
+    out.ok = true;
+    out.step = 'opened';
+    out.name = want;
+    return out;
+  }
+
   if (mode === 'verify-conv') {
     // 「会话有没有真的打开」—— 判据是**会话头的 .name-text 在不在**。
     // 没打开时这个面板显示的是空状态文案（「与您进行过沟通的 Boss 都会在左侧列表中显示」），
@@ -1338,6 +1945,36 @@ function pageGreetingTask(arg) {
     for (let i = Math.max(0, n - 6); i < n; i++) out.messages.push(txt(items[i]).slice(0, 100));
     out.ok = true;
     out.step = 'messages';
+    return out;
+  }
+
+  if (mode === 'check-resume-sent') {
+    // 「简历到底发出去了没有」—— **页面上的状态**，不用去问服务端。
+    //
+    // 投递成功后会话里会出现（实测 2026-11-15，四种情形都验过）：
+    //   「附件简历请求已发送」                              （弹窗确认后走的流程）
+    //   「您的附件简历 张铸简历-… 已发送给Boss点击查看附件」   （直接发出走的流程）
+    //   「张铸简历-20261112.pdf 点击预览附件简历」
+    //
+    // ⚠️ **判据不能用「附件简历」四个字** ——
+    //    HR 在打招呼时带的简历请求卡片上就写着「我想要一份您的附件简历，您是否同意」，
+    //    用那四个字会把**HR 的请求**当成**我发出的简历**，
+    //    于是「点完发简历其实啥也没发」也会被判成成功。
+    //    只用「投递完成」才出现的标记。
+    const SENT_MARKERS = /附件简历请求已发送|已发送给Boss|点击预览附件简历/;
+    const items = document.querySelectorAll('.im-list .message-item');
+    const texts = [];
+    let delivered = false;
+    for (const it of items) {
+      const t = txt(it);
+      texts.push(t.slice(0, 100));
+      if (SENT_MARKERS.test(t)) delivered = true;
+    }
+    out.ok = true;
+    out.step = 'check-resume-sent';
+    out.delivered = delivered;
+    out.messageCount = items.length;
+    out.messages = texts.slice(-6);
     return out;
   }
 

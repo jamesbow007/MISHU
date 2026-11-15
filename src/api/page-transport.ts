@@ -74,29 +74,43 @@ export async function fetchPage(url: string): Promise<any> {
  * 「未读」tab 上没有数字、行里也没有 notice-badge 徽标 —— 那不是「没有未读」，
  * 是「还没算出来」。所以读到这种状态要等一下再读。
  */
-export async function probeDom(url: string, probe = 'unread', retries = 3): Promise<any> {
+/**
+ * 两次「读状态」之间的间隔。
+ *
+ * 这**不是**「等多久状态会好」的猜测 —— 它只是「多久看一眼」的节奏。
+ * 什么时候算好由状态本身决定（看到了就立刻返回），budgetMs 只是兜底上限。
+ */
+const POLL_GAP_MS = 500;
+
+export async function probeDom(url: string, probe = 'unread', budgetMs = 10_000): Promise<any> {
   let last: any = null;
-  for (let attempt = 0; attempt < retries; attempt++) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
     last = await runTaskChecked(
       { kind: 'page', url, type: 'dom', probe, waitMs: 800 },
       BRIDGE_TASK_TIMEOUT_MS + 2_000,
       'DOM 探针',
     );
-    if (!last) continue;
+    if (!last) {
+      if (Date.now() >= deadline) return last;
+      continue;
+    }
 
     // 页面还没渲染出「未读」tab → 继续等
     const tabText = String(last.unreadTabText ?? '');
-    if (!tabText.includes('未读')) continue;
+    if (!tabText.includes('未读')) {
+      if (Date.now() >= deadline) return last;
+      await sleep(POLL_GAP_MS);
+      continue;
+    }
     // tab 上有数字、或列表里已经有徽标 → 说明前端算完了
     if (/\(\d+\)/.test(tabText)) return last;
     if ((last.allRows ?? []).some((r: any) => r.unread > 0)) return last;
 
     // 「未读」在但没有数字、也没有徽标 —— 可能是真的 0，也可能还没推完，再等一轮
-    if (attempt < retries - 1) {
-      await sleep(1500);
-    }
+    if (Date.now() >= deadline) return last;
+    await sleep(POLL_GAP_MS);
   }
-  return last;
 }
 
 /**
@@ -135,7 +149,16 @@ export async function runActions(url: string, actions: any[]): Promise<any[]> {
 export async function runPageFn(
   fnName: string,
   arg: any,
-  opts: { url?: string; timeoutMs?: number; pin?: boolean; own?: boolean } = {},
+  opts: {
+    url?: string;
+    timeoutMs?: number;
+    pin?: boolean;
+    own?: boolean;
+    /** 用完别关这个标签页（调用方自己管它的生命周期） */
+    keep?: boolean;
+    /** 直接在指定的标签页里操作 */
+    tabId?: number;
+  } = {},
 ): Promise<any> {
   return runTaskChecked(
     {
@@ -146,11 +169,44 @@ export async function runPageFn(
       arg,
       pin: opts.pin,
       own: opts.own,
+      keep: opts.keep,
+      tabId: opts.tabId,
       waitMs: 1500,
     },
     opts.timeoutMs ?? BRIDGE_TASK_TIMEOUT_MS + 5_000,
     '页面函数执行',
   );
+}
+
+/**
+ * 同 runPageFn，但把**标签页 id** 一起带回来。
+ *
+ * 「点立即沟通」可能会开出一个新的聊天标签页 —— 发消息得知道去哪个标签页里发，
+ * 所以这一步必须知道刚才那个任务跑在哪个 tab 上。
+ */
+export async function runPageFnFull(
+  fnName: string,
+  arg: any,
+  opts: Parameters<typeof runPageFn>[2] = {},
+): Promise<{ data: any; tabId: number | null }> {
+  const payload = await bridge.runTask(
+    {
+      kind: 'page',
+      url: opts.url ?? CHAT_URL,
+      type: 'dom',
+      fn: fnName,
+      arg,
+      pin: opts.pin,
+      own: opts.own,
+      keep: opts.keep,
+      tabId: opts.tabId,
+      waitMs: 1500,
+    },
+    opts.timeoutMs ?? BRIDGE_TASK_TIMEOUT_MS + 5_000,
+  );
+  if (!payload) throw new Error('扩展没有返回结果');
+  if (payload.ok === false) throw new Error(payload.error || '页面函数执行失败');
+  return { data: payload.data ?? null, tabId: payload.tabId ?? null };
 }
 
 /**
@@ -161,6 +217,68 @@ export async function runPageFn(
  */
 export async function releasePinnedTab(): Promise<void> {
   await runTaskChecked({ kind: 'tab-release' }, BRIDGE_TASK_TIMEOUT_MS + 2_000, '释放固定标签页');
+}
+
+/**
+ * 在页面上下文里发一个 GET 请求，返回解析后的 JSON。
+ *
+ * 两个坑：
+ *
+ * ① **网关签名（code=37）**
+ *    BOSS 的接口要带 `__zp_stoken__`，那是页面里的安全 JS 跑出来的，
+ *    有效期不长。过期了接口就返回 `code:37`。
+ *    解法不是重试同一个请求（没用），而是**让页面真实重载一次**——
+ *    它的安全 JS 会重新刷新 token，然后再请求就成了。
+ *
+ * ② **cookie 必须在页面上下文里带**
+ *    直连 HTTP 只能拿到部分 cookie（会话 cookie 是 HttpOnly / 分区的），
+ *    页面里 fetch 才带得全。所以走扩展的 api 任务。
+ */
+export async function pageApiJson(
+  url: string,
+  opts: { refreshUrl?: string; timeoutMs?: number; tokenBudgetMs?: number } = {},
+): Promise<any> {
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+
+  const once = async (): Promise<any> => {
+    const payload = await bridge.runTask({ kind: 'api', url, method: 'GET' }, timeoutMs);
+    if (!payload) throw new Error('扩展没有返回结果');
+    if (payload.ok === false) throw new Error(payload.error || '页面代理请求失败');
+    const text = String(payload.text ?? '');
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { code: 'parse-fail', __raw: text.slice(0, 200) };
+    }
+  };
+
+  let json = await once();
+  if (json?.code === 37) {
+    // token 过期 → 让页面重载一次刷新它
+    await bridge.runTask(
+      {
+        kind: 'page',
+        url: opts.refreshUrl ?? 'https://www.zhipin.com/web/geek/jobs?ka=header-jobs',
+        type: 'dom',
+        actions: [{ type: 'text', limit: 1 }],
+        own: true,
+        waitMs: 2000,
+      },
+      BRIDGE_TASK_TIMEOUT_MS,
+    );
+    // 然后**一直查到不再报 37 为止** —— 不写死「等 1.2 秒」。
+    // 页面重载要好几秒才跑完安全 JS，慢网下 1.2 秒根本不够，
+    // 而「还在报 37」这个事实本身就是判据。
+    const until = Date.now() + (opts.tokenBudgetMs ?? 20_000);
+    for (;;) {
+      const t0 = Date.now();
+      await sleep(Math.max(300, Date.now() - t0));
+      json = await once();
+      if (json?.code !== 37) break;
+      if (Date.now() >= until) break;
+    }
+  }
+  return json;
 }
 
 /** 浏览器标签页清单（--tabs 排查用） */
@@ -199,4 +317,32 @@ export async function closeLeakedChatTabs(dryRun = true): Promise<{
     BRIDGE_TASK_TIMEOUT_MS + 2_000,
     '清理标签页',
   );
+}
+
+/** 关掉指定的几个标签页（用完自己开的那些要收掉 —— 攒多了会变成标签页泄漏） */
+export async function closeTabs(tabIds: number[]): Promise<number> {
+  const ids = (tabIds ?? []).filter((n) => Number.isFinite(n) && n > 0);
+  if (!ids.length) return 0;
+  const r = await runTaskChecked(
+    { kind: 'tab-close', tabIds: ids },
+    BRIDGE_TASK_TIMEOUT_MS + 2_000,
+    '关闭标签页',
+  );
+  return Number(r?.closed ?? 0);
+}
+
+/**
+ * 重载一个标签页 —— 救「页面卡在初始化之前」的情况。
+ *
+ * 实测：后台标签页有时列表请求压根没发出去，页面一直空着；
+ * 重载一下它就正常了（初始化会重跑一遍）。
+ */
+export async function reloadTab(tabId: number): Promise<boolean> {
+  if (!tabId) return false;
+  const r = await runTaskChecked(
+    { kind: 'tab-reload', tabId },
+    BRIDGE_TASK_TIMEOUT_MS + 2_000,
+    '重载标签页',
+  );
+  return !!r?.reloaded;
 }
