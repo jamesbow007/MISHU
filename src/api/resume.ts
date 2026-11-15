@@ -7,13 +7,26 @@
  * 为什么不读附件简历（PDF）：那个要下载 + 解析，在线简历本身就是结构化文本，
  * 而且 HR 看到的也是这份 —— 拿它做匹配才对得上。
  */
-import { runPageFn } from './page-transport.js';
+import { createHash } from 'node:crypto';
+
+import { closeTabs, runPageFnFull } from './page-transport.js';
+import { sleep } from './util.js';
 
 export const RESUME_URL = 'https://www.zhipin.com/web/geek/resume';
 
 export interface ResumeBlock {
   title: string;
   text: string;
+}
+
+/**
+ * 简历指纹 —— 判断结果缓存的钥匙。
+ *
+ * 改了简历（加项目、改优势），匹配结论就该重算；
+ * 用「摘要的哈希」当指纹，缓存一比对就知道该不该作废。
+ */
+export function profileSignature(summary: string): string {
+  return createHash('sha1').update(summary).digest('hex').slice(0, 12);
 }
 
 export interface MyProfile {
@@ -32,19 +45,43 @@ export interface MyProfile {
   summary: string;
 }
 
-/** 各块在摘要里最多留多少字 —— 项目经历最长，不截的话一个岗位的 JD 都不够地方放了 */
-const SUMMARY_LIMIT: Record<string, number> = {
-  个人优势: 800,
-  期望职位: 200,
-  工作经历: 900,
-  项目经历: 2200,
-  专业技能: 600,
-  教育经历: 300,
-};
+/**
+ * 摘要里保留哪几块。
+ *
+ * 用户定的（2026-11-15，最后一版）：
+ *   - **只留个人优势**，全不截断 —— 技术栈自述，判断匹不匹配和写开场白都用它
+ *   - 项目经历也拿掉：写给 HR 的招呼语里罗列项目太刻意，而且 HR 看不懂那些细节
+ *   - 其余（期望职位 / 工作经历 / 专业技能 / 教育经历 / 资格证书 / 其它）全不要
+ */
+const SUMMARY_BLOCKS = ['个人优势'];
 
-/** 读我的在线简历 */
+/**
+ * 读我的在线简历。
+ *
+ * ⚠️ **等状态，不等时长**：简历页是 SPA，页面加载完 ≠ 内容渲染好了。
+ * 之前固定等 1.5 秒就读，实测读到过**空页面**（拿到的 blocks 是空的，
+ * 后面模型就拿着空简历去判断）。现在一直读到真的有内容为止。
+ *
+ * 复用同一个标签页重试（不每读一次就开一个新页）。
+ */
 export async function readMyProfile(): Promise<MyProfile> {
-  const r = await runPageFn('resume', { mode: 'read' }, { url: RESUME_URL, own: true });
+  const deadline = Date.now() + 15_000;
+  let tabId: number | null = null;
+  let r: any = null;
+
+  for (;;) {
+    const res: any = await runPageFnFull(
+      'resume',
+      { mode: 'read' },
+      { url: RESUME_URL, own: true, keep: true, tabId: tabId ?? undefined },
+    ).catch(() => null);
+    tabId = res?.tabId ?? tabId;
+    r = res?.data ?? null;
+    if (r?.ok && (r.blocks?.length ?? 0) > 0) break;
+    if (Date.now() >= deadline) break;
+    await sleep(500);
+  }
+  if (tabId) await closeTabs([tabId]).catch(() => {});
   if (!r?.ok) throw new Error('读简历失败：' + (r?.error ?? '未知原因'));
 
   const info = r.info ?? {};
@@ -80,13 +117,19 @@ export async function readMyProfile(): Promise<MyProfile> {
 
   const full = blocks.map((b) => `【${b.title}】${b.text}`).join('\n');
 
-  const summary = blocks
-    .map((b) => {
-      const limit = SUMMARY_LIMIT[b.title] ?? 300;
-      const text = b.text.length > limit ? b.text.slice(0, limit) + '…' : b.text;
-      return `【${b.title}】${text}`;
-    })
-    .join('\n');
+  // 摘要 = 只留个人优势，**一段不截**。
+  //
+  // ⚠️ 个人优势读不到时**宁可报错**，也不退回用全部块 ——
+  //    全部块里含工作经历和项目经历，而用户明确要求这两块不进当前工作流
+  //    （工作经历他之后要重新包装）。宁停一轮，也不要偷偷换个输入源。
+  const picked = blocks.filter((b) => SUMMARY_BLOCKS.includes(b.title));
+  if (!picked.length) {
+    throw new Error(
+      `简历里没读到「${SUMMARY_BLOCKS.join('/')}」这一块（页面可能改版了）—— ` +
+      `读到的块有：${blocks.map((b) => b.title).join('、') || '(空)'}`,
+    );
+  }
+  const summary = picked.map((b) => `【${b.title}】${b.text}`).join('\n');
 
   return {
     name,

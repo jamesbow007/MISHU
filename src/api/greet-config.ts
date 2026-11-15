@@ -17,10 +17,6 @@ import type { LlmConfig } from './llm.js';
 export const CONFIG_FILE = path.join(DATA_DIR, 'greet-config.json');
 
 export interface GreetConfig {
-  /** 搜索关键词（走搜索接口那条路） */
-  query: string;
-  /** 城市码列表 —— 每个城市各取一遍推荐 + 搜索 */
-  cities: string[];
   /** 薪资下限（K）。0 = 不限 */
   salaryMinK: number;
   /** 学历白名单（空 = 不限） */
@@ -49,14 +45,12 @@ export interface GreetConfig {
 }
 
 export const DEFAULT_CONFIG: GreetConfig = {
-  query: '大模型算法',
-  cities: ['101010100', '101280600'], // 北京、深圳
   salaryMinK: 0,
   degrees: [],
   experiences: [],
   pages: 1,
-  candidates: 40,
-  batchSize: 4,
+  candidates: 30,
+  batchSize: 3,
   perRound: 20,
   dailyLimit: 0,
   roundGapSec: 300,
@@ -74,7 +68,6 @@ export function loadGreetConfig(): GreetConfig {
     file = {};
   }
   const cfg: GreetConfig = { ...DEFAULT_CONFIG, ...file };
-  cfg.cities = Array.isArray(cfg.cities) && cfg.cities.length ? cfg.cities : DEFAULT_CONFIG.cities;
   cfg.llm = file.llm;
   return cfg;
 }

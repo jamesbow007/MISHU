@@ -236,7 +236,7 @@ export async function releasePinnedTab(): Promise<void> {
  */
 export async function pageApiJson(
   url: string,
-  opts: { refreshUrl?: string; timeoutMs?: number; tokenBudgetMs?: number } = {},
+  opts: { timeoutMs?: number } = {},
 ): Promise<any> {
   const timeoutMs = opts.timeoutMs ?? 15_000;
 
@@ -253,31 +253,8 @@ export async function pageApiJson(
   };
 
   let json = await once();
-  if (json?.code === 37) {
-    // token 过期 → 让页面重载一次刷新它
-    await bridge.runTask(
-      {
-        kind: 'page',
-        url: opts.refreshUrl ?? 'https://www.zhipin.com/web/geek/jobs?ka=header-jobs',
-        type: 'dom',
-        actions: [{ type: 'text', limit: 1 }],
-        own: true,
-        waitMs: 2000,
-      },
-      BRIDGE_TASK_TIMEOUT_MS,
-    );
-    // 然后**一直查到不再报 37 为止** —— 不写死「等 1.2 秒」。
-    // 页面重载要好几秒才跑完安全 JS，慢网下 1.2 秒根本不够，
-    // 而「还在报 37」这个事实本身就是判据。
-    const until = Date.now() + (opts.tokenBudgetMs ?? 20_000);
-    for (;;) {
-      const t0 = Date.now();
-      await sleep(Math.max(300, Date.now() - t0));
-      json = await once();
-      if (json?.code !== 37) break;
-      if (Date.now() >= until) break;
-    }
-  }
+  // code=37 的退避重试在 bridge.runTask 里统一做了（那是所有 api 请求的收口处），
+  // 这里不再重复处理。
   return json;
 }
 

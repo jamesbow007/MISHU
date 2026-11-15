@@ -1,14 +1,11 @@
 /**
  * 岗位来源 —— 「主动投递」的弹药从这儿来。
  *
- * 两条路（用户选的「推荐 + 搜索接口筛选」）：
- *   ① 推荐区：按 BOSS 里设的**期望工作**推的岗位
- *      /wapi/zpgeek/pc/recommend/expect/list.json  → 期望项（大模型算法 深圳/北京）
- *      /wapi/zpgeek/pc/recommend/job/list.json     → 该期望下的岗位
- *   ② 搜索接口：自己按关键词 / 城市 / 薪资 / 经验 / 学历筛
- *      /wapi/zpgeek/search/joblist.json
+ * **只走职位页的「推荐」区**（用户 2026-11-15 定的）：
+ *   /wapi/zpgeek/pc/recommend/expect/list.json  → 期望项（大模型算法 深圳/北京）
+ *   /wapi/zpgeek/pc/recommend/job/list.json     → 该期望下的岗位（15 条/页）
  *
- * 两条路都走接口而不是读 DOM —— 接口给的是**明文薪资**，
+ * 为什么走接口而不是读 DOM —— 接口给的是**明文薪资**，
  * 页面上那个数字是自定义字体渲染的，DOM 里读出来是空的。
  *
  * JD 正文单独取：/wapi/zpgeek/job/detail.json?securityId=…&lid=…
@@ -20,6 +17,24 @@ import { DATA_DIR } from './llm.js';
 import { pageApiJson } from './page-transport.js';
 
 export const JOBS_URL = 'https://www.zhipin.com/web/geek/jobs?ka=header-jobs';
+
+/**
+ * 「被风控了」—— list 类接口返回 code=37。
+ *
+ * 单独一个错误类型，是为了调用方能**跳过剩下的列表请求**：
+ * 被挡了之后再打下一个，只会再被挡一次（每次还白等一个安静期）。
+ */
+export class RateLimitedError extends Error {
+  constructor(url: string) {
+    super('被风控了（code=37）：' + url);
+    this.name = 'RateLimitedError';
+  }
+}
+
+/** 列表接口被挡了就抛这个错（其它错误照常抛） */
+function assertNotBlocked(json: any, url: string): void {
+  if (Number(json?.code) === 37) throw new RateLimitedError(url);
+}
 
 /**
  * JD 缓存 —— 详情接口是最慢的一环（实测一条 1.4 秒，40 条要近一分钟）。
@@ -186,7 +201,9 @@ function toJob(raw: any, source: 'recommend' | 'search', expectLabel?: string): 
 
 /** 读期望工作列表（大模型算法 深圳 / 北京 …） */
 export async function listExpects(): Promise<ExpectItem[]> {
-  const json = await pageApiJson(`${API}/pc/recommend/expect/list.json`);
+  const url = `${API}/pc/recommend/expect/list.json`;
+  const json = await pageApiJson(url);
+  assertNotBlocked(json, url);
   const list = json?.zpData?.expectList;
   if (!Array.isArray(list)) return [];
   return list.map((e: any) => ({
@@ -224,40 +241,13 @@ export async function listRecommendJobs(
     industry: '',
     scale: '',
   });
-  const json = await pageApiJson(`${API}/pc/recommend/job/list.json?${qs}`);
+  const url = `${API}/pc/recommend/job/list.json?${qs}`;
+  const json = await pageApiJson(url);
+  assertNotBlocked(json, url);
   const list = json?.zpData?.jobList;
   if (!Array.isArray(list)) return [];
   const label = `${expect.positionName}（${expect.locationName}）`;
   return list.map((r: any) => toJob(r, 'recommend', label));
-}
-
-/** 搜索接口的参数 */
-export interface SearchParams {
-  query?: string;
-  city?: string;
-  salary?: string;
-  experience?: string;
-  degree?: string;
-  page?: number;
-  pageSize?: number;
-}
-
-/** 按关键词 / 城市 / 薪资 / 经验 / 学历搜岗位 */
-export async function listSearchJobs(params: SearchParams = {}): Promise<Job[]> {
-  const qs = new URLSearchParams({
-    scene: '1',
-    query: params.query ?? '',
-    city: params.city ?? '',
-    salary: params.salary ?? '',
-    experience: params.experience ?? '',
-    degree: params.degree ?? '',
-    page: String(params.page ?? 1),
-    pageSize: String(params.pageSize ?? 30),
-  });
-  const json = await pageApiJson(`${API}/search/joblist.json?${qs}`);
-  const list = json?.zpData?.jobList;
-  if (!Array.isArray(list)) return [];
-  return list.map((r: any) => toJob(r, 'search'));
 }
 
 /**
@@ -284,7 +274,9 @@ export async function fetchJobDetail(job: Job): Promise<JobDetail> {
   }
 
   const qs = new URLSearchParams({ securityId: job.securityId, lid: job.lid });
-  const json = await pageApiJson(`${API}/job/detail.json?${qs}`);
+  const url = `${API}/job/detail.json?${qs}`;
+  const json = await pageApiJson(url);
+  assertNotBlocked(json, url);
   const d = json?.zpData ?? {};
   const ji = d.jobInfo ?? {};
   const bi = d.bossInfo ?? {};

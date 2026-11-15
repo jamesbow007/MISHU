@@ -112,6 +112,13 @@ export interface JudgementCacheEntry {
   reason: string;
   greeting: string;
   /**
+   * 判断时的**简历指纹**。
+   *
+   * 为什么必须记：判断结果依赖简历内容 —— 改了简历，匹配结论就该重算。
+   * 只按 jobId 缓存的话，改完简历 24 小时内都还在用旧结论。
+   */
+  profileSig?: string;
+  /**
    * 岗位元数据（securityId / lid / HR 名字…）。
    *
    * 为什么连它一起存：岗位列表每轮都在轮换 —— 上一轮排第一的岗位，

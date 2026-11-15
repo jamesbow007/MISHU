@@ -25,6 +25,81 @@ export const BRIDGE_PORT = 39115;
  */
 export const BRIDGE_TASK_TIMEOUT_MS = 20_000;
 
+/**
+ * zhipin 接口的调用间隔（毫秒）—— **按接口分档**。
+ *
+ * 实测（2026-11-15）：
+ *   - **列表类**（recommend/job/list、search/joblist、expect/list）：
+ *     连打 **2 个**就 code=37，而且安静 90 秒都解不开（要好几分钟）
+ *   - **详情类**（job/detail）：连打 40 个都没事
+ *
+ * 所以列表类给 3 秒的宽裕间隔，详情类可以快一点（40 条 ≈ 1 分钟）。
+ */
+const API_GAP_LIST_MS = 3_000;
+const API_GAP_OTHER_MS = 1_200;
+
+/** 列表类接口的判定（这几个是「驱动页面」的接口，风控最紧） */
+function apiGapMs(url: string): number {
+  return /\/list\.json|\/expect\/list|\/search\/joblist/.test(url) ? API_GAP_LIST_MS : API_GAP_OTHER_MS;
+}
+
+/**
+ * 被风控后的**安静期**（毫秒）—— 这段时间内一个请求都不发。
+ *
+ * 实测：触发后 45 秒仍然 37，再等 60 秒就恢复了 → 恢复要 1~2 分钟的安静期。
+ * ⚠️ 安静期里**不能重试** —— 每个请求都在刷新风控计时（实测重试 90 秒一次都没解开）。
+ */
+const API_RATE_LIMIT_QUIET_MS = 90_000;
+
+/** 风控冷静期到什么时候为止（到点之前不发 api 请求） */
+let rateLimitedUntil = 0;
+
+/**
+ * 「风控解不开了」—— 恢复失败之后置位。
+ *
+ * 置位之后的 api 请求**立刻失败**（不等安静期）。
+ * 否则一轮取 40 个 JD 时，每个都白等 90 秒 = 一小时。
+ * 下一轮隔几分钟再跑，风控自然就过去了。
+ */
+let apiBlocked = false;
+
+/**
+ * 这一轮已经用了几次「安静期」来解封。
+ *
+ * 有一次 api 请求成功就清零（额度重新算）。
+ * 用满 API_RATE_LIMIT_MAX_TRIES 次还解不开 → apiBlocked，剩下的请求立刻失败。
+ */
+let rateLimitRetries = 0;
+const API_RATE_LIMIT_MAX_TRIES = 2;
+
+let lastApiAt = 0;
+
+/** api 请求的全局排队（按接口档位决定间隔） */
+async function throttleApi(url = ''): Promise<void> {
+  const gap = url ? apiGapMs(url) : API_GAP_OTHER_MS;
+  const wait = lastApiAt + gap - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastApiAt = Date.now();
+}
+
+/**
+ * 这个结果是不是「被风控了」。
+ *
+ * ⚠️ **zhipin 的业务 code 不在响应的顶层** —— 扩展把接口的原始 body 放在
+ * `text`（一个 JSON 字符串）里，顶层只有 `{ok, status, text, headers}`。
+ * 所以不能看 `out.code`，得看 body 里的 code。
+ */
+function isRateLimited(out: any): boolean {
+  if (out?.code === 37) return true;
+  const t = out?.text;
+  if (typeof t !== 'string' || !t.includes('"code"')) return false;
+  try {
+    return Number(JSON.parse(t)?.code) === 37;
+  } catch {
+    return /"code"\s*:\s*37\b/.test(t);
+  }
+}
+
 /** 扩展回传的 cookie（只有 name/value/domain 三个字段被真正消费） */
 export interface PlainCookie {
   name: string;
@@ -337,18 +412,76 @@ export class CookieBridge {
    */
   async runTask(task: any, timeoutMs = BRIDGE_TASK_TIMEOUT_MS + 5_000): Promise<any> {
     // 本地与远程统一走 HTTP /task，宿主负责派发给扩展并回传结果
-    const res = await fetch(`http://127.0.0.1:${BRIDGE_PORT}/task`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(task),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      return { ok: false, error: text.slice(0, 200) };
+    const send = async () => {
+      const res = await fetch(`http://127.0.0.1:${BRIDGE_PORT}/task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(task),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return { ok: false, error: text.slice(0, 200) };
+      }
+    };
+
+    // zhipin 接口的**全局限速** —— 所有 api 请求排队，最小间隔 API_MIN_GAP_MS。
+    //
+    // 为什么必须放在这里（而不是各调用方自己限）：
+    //   页面代理（HTTP 客户端）和直接调接口（pageApiJson）走的是同一个扩展任务，
+    //   各自限速等于没限 —— 实测列表类接口连打 2~3 个就 code=37。
+    if (task?.kind === 'api') {
+      // 已经确认「风控解不开了」→ 立刻返回被挡，**不再等**。
+      //
+      // 为什么必须这样：风控一触发，每个请求都要等一个安静期（90 秒）。
+      // 一轮要取 40 个 JD —— 每个都等 90 秒就是**一个小时**。
+      // 所以「恢复失败」之后，剩下的请求一律快速失败，让这一轮尽快收工
+      // （下一轮隔几分钟再跑，风控早就过去了）。
+      if (apiBlocked) {
+        return {
+          ok: true,
+          status: 200,
+          text: JSON.stringify({ code: 37, message: '您的环境存在异常。' }),
+          headers: {},
+        };
+      }
+      // 还处在风控冷静期 → 安静等到期，别发请求（发请求就是在续命，见下）
+      const quiet = rateLimitedUntil - Date.now();
+      if (quiet > 0) await sleep(quiet);
+      await throttleApi(String(task?.url ?? ''));
     }
+
+    let out = await send();
+
+    // code=37 = **风控**（「您的环境存在异常」），不是 token 过期。
+    //
+    // ⚠️ **不能靠「密集重试」解封** —— 实测：触发后每 5~20 秒重试一次、
+    //    重试满 90 秒，一次都没解开（每个请求都在刷新风控计时，越打越不解封）。
+    //    真正管用的是**安静期**：不发任何请求，等。
+    //
+    // 所以：安静等 → 试一次。惩罚通常是「触发后 2 分钟上下」，
+    // 一次安静期不够就再来一次（最多两次），之后才彻底放弃。
+    if (isRateLimited(out)) {
+      while (rateLimitRetries < API_RATE_LIMIT_MAX_TRIES) {
+        rateLimitRetries++;
+        rateLimitedUntil = Date.now() + API_RATE_LIMIT_QUIET_MS;
+        await sleep(API_RATE_LIMIT_QUIET_MS);
+        await throttleApi(String(task?.url ?? ''));
+        out = await send();
+        if (!isRateLimited(out)) break;
+      }
+      if (isRateLimited(out)) {
+        rateLimitedUntil = Date.now() + API_RATE_LIMIT_QUIET_MS;
+        apiBlocked = true; // 恢复不了 —— 后面的 api 请求一律快速失败
+      }
+    }
+    if (task?.kind === 'api' && !isRateLimited(out)) {
+      apiBlocked = false;
+      rateLimitRetries = 0; // 有一次成功了 → 额度重新算
+    }
+    return out;
   }
 
   /**

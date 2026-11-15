@@ -6,8 +6,6 @@
  *   npm run greet -- --once            实发一轮
  *   npm run greet                      常驻，一轮一轮来
  *   npm run greet -- --limit 5         一轮最多联系 5 个
- *   npm run greet -- --city 101010100  只看某个城市（城市码）
- *   npm run greet -- --query 大模型算法 换搜索关键词
  *
  * 前提：
  *   - Chrome 开着、已登录 BOSS直聘、扩展已加载
@@ -37,17 +35,16 @@ import {
   sentToday,
 } from '../api/greet-state.js';
 import {
-  CITY_CODES,
   fetchJobDetail,
   listExpects,
   listRecommendJobs,
-  listSearchJobs,
-  salaryLowK,
+  RateLimitedError,
+
   type Job,
 } from '../api/jobs.js';
 import { loadLlmConfig, llmMissingHint, type LlmConfig } from '../api/llm.js';
 import { judgeJobs, type Judgement } from '../api/match.js';
-import { readMyProfile } from '../api/resume.js';
+import { profileSignature, readMyProfile } from '../api/resume.js';
 import { sleep } from '../api/util.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -92,68 +89,97 @@ async function waitForExtension(timeoutMs: number): Promise<boolean> {
 /* ---------------- 收集岗位 ---------------- */
 
 /**
- * 收集候选岗位：推荐区 + 搜索接口，按 jobId 去重。
+ * 收集候选岗位：**只走职位页的「推荐」区**，按 jobId 去重。
  *
- * 两条路都会给 15~30 条/页，翻几页由配置里的 pages 决定。
+ * ⚠️ **列表请求是稀缺资源** —— 实测连打 4~5 个就撞风控（code=37），
+ *    被挡之后要等好几分钟才恢复。所以：
+ *      ① 期望项缓存起来（很少变），每轮省一次请求
+ *      ② 一旦被挡，**立刻停掉剩下的列表请求**（再打也只是再被挡一次，
+ *         每次还白等一个 90 秒安静期）
+ *
+ * 每个期望（大模型算法 深圳 / 北京）一页 15 条 —— 页面自己就是这么取的
+ * （pageSize 传 30/50/100 也只给 15）。
  */
-async function collectJobs(cfg: GreetConfig, cities: string[]): Promise<Job[]> {
+async function collectJobs(cfg: GreetConfig): Promise<Job[]> {
   const out = new Map<string, Job>();
+  let blocked = false;
 
-  // ① 推荐区（BOSS 里设的期望工作）
   try {
-    const expects = await listExpects();
+    const expects = await loadExpects();
     log(`期望工作 ${expects.length} 项：${expects.map((e) => `${e.positionName}（${e.locationName}）`).join('、') || '（没设）'}`);
     for (const e of expects) {
+      if (blocked) break;
       for (let p = 1; p <= cfg.pages; p++) {
-        const jobs = await listRecommendJobs(e, p);
-        log(`  推荐 ${e.positionName}（${e.locationName}）第 ${p} 页：${jobs.length} 条`);
-        for (const j of jobs) if (j.jobId && !out.has(j.jobId)) out.set(j.jobId, j);
+        if (blocked) break;
+        try {
+          const jobs = await listRecommendJobs(e, p);
+          log(`  推荐 ${e.positionName}（${e.locationName}）第 ${p} 页：${jobs.length} 条`);
+          for (const j of jobs) if (j.jobId && !out.has(j.jobId)) out.set(j.jobId, j);
+        } catch (err) {
+          if (err instanceof RateLimitedError) {
+            blocked = true;
+            log('  ⚠️ 被风控了 —— 停止本轮剩下的列表请求（已拿到的照常用）');
+            break;
+          }
+          log('  ⚠️ 推荐页失败：' + (err as Error).message);
+        }
       }
     }
   } catch (e) {
-    log('⚠️ 读推荐区失败：' + (e as Error).message);
-  }
-
-  // ② 搜索接口
-  for (const city of cities) {
-    for (let p = 1; p <= cfg.pages; p++) {
-      try {
-        const jobs = await listSearchJobs({ query: cfg.query, city, page: p, pageSize: 30 });
-        log(`  搜索「${cfg.query}」${cityName(city)} 第 ${p} 页：${jobs.length} 条`);
-        for (const j of jobs) if (j.jobId && !out.has(j.jobId)) out.set(j.jobId, j);
-      } catch (e) {
-        log(`⚠️ 搜索 ${cityName(city)} 第 ${p} 页失败：` + (e as Error).message);
-      }
+    if (e instanceof RateLimitedError) {
+      blocked = true;
+      log('  ⚠️ 期望项被风控挡了 —— 停止本轮剩下的列表请求');
+    } else {
+      log('⚠️ 读推荐区失败：' + (e as Error).message);
     }
   }
 
   return [...out.values()];
 }
 
-function cityName(code: string): string {
-  for (const [n, c] of Object.entries(CITY_CODES)) if (c === code) return n;
-  return code;
+/**
+ * 期望项缓存 6 小时。
+ *
+ * 期望很少改，但它是一次**列表请求** —— 风控额度紧张，能省一次是一次。
+ */
+const EXPECT_CACHE_FILE = path.join(DATA_DIR, 'greet-expects.json');
+const EXPECT_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function loadExpects(): Promise<Awaited<ReturnType<typeof listExpects>>> {
+  try {
+    const c = JSON.parse(fs.readFileSync(EXPECT_CACHE_FILE, 'utf8'));
+    if (c?.at && Date.now() - c.at < EXPECT_TTL_MS && Array.isArray(c.list) && c.list.length) {
+      log(`  期望项用缓存（${c.list.length} 项，${Math.round((Date.now() - c.at) / 60000)} 分钟前取的）`);
+      return c.list;
+    }
+  } catch {
+    /* 没有缓存 */
+  }
+  const list = await listExpects();
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(EXPECT_CACHE_FILE, JSON.stringify({ at: Date.now(), list }), 'utf8');
+  } catch {
+    /* 缓存写不进去不影响主流程 */
+  }
+  return list;
 }
 
-/** 粗筛：薪资 / 学历 / 经验 / 冷却期 */
+/**
+ * 粗筛 —— **只挡「已经联系过的」**。
+ *
+ * 为什么不做别的筛选（用户 2026-11-15 的判断）：
+ *   列表接口白送的「要求年限 / 要求学历 / 工作城市」**不一定是真的门槛**，
+ *   很多岗位只是照着模板写上去的。真匹不匹配要看简历和 JD 的内容 ——
+ *   那是大模型的活，不是几个字段能判的。
+ *   所以这里只保留去重（别再打扰同一个 HR），其余全交给模型。
+ */
 function filterJobs(jobs: Job[], cfg: GreetConfig): { kept: Job[]; dropped: Record<string, number> } {
-  const dropped: Record<string, number> = { 薪资: 0, 学历: 0, 经验: 0, 已联系过: 0 };
+  const dropped: Record<string, number> = { 已联系过: 0 };
   const state = loadGreetState();
   const kept: Job[] = [];
 
   for (const j of jobs) {
-    if (cfg.salaryMinK > 0 && salaryLowK(j) > 0 && salaryLowK(j) < cfg.salaryMinK) {
-      dropped['薪资']!++;
-      continue;
-    }
-    if (cfg.degrees.length && j.degree && !cfg.degrees.includes(j.degree)) {
-      dropped['学历']!++;
-      continue;
-    }
-    if (cfg.experiences.length && j.experience && !cfg.experiences.includes(j.experience)) {
-      dropped['经验']!++;
-      continue;
-    }
     if (greetedRecently(state, j.jobId, cfg.cooldownDays)) {
       dropped['已联系过']!++;
       continue;
@@ -168,7 +194,6 @@ function filterJobs(jobs: Job[], cfg: GreetConfig): { kept: Job[]; dropped: Reco
 interface RoundOpts {
   dryRun: boolean;
   limit: number;
-  cities: string[];
   /** 只跟这一个岗位打招呼（补投用），不填就按分数从高到低 */
   pick?: string;
 }
@@ -184,10 +209,10 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
 
   // ② 收集岗位
   log('收集岗位…');
-  const all = await collectJobs(cfg, opts.cities);
+  const all = await collectJobs(cfg);
   log(`  合计 ${all.length} 条（去重后）`);
 
-  // ③ 粗筛
+  // ③ 粗筛（只挡已经联系过的；其余交给大模型按简历和 JD 判）
   const { kept, dropped } = filterJobs(all, cfg);
   const dropTxt = Object.entries(dropped).filter(([, n]) => n > 0).map(([k, n]) => `${k}${n}`).join(' ');
   log(`  粗筛后 ${kept.length} 条${dropTxt ? `（去掉：${dropTxt}）` : ''}`);
@@ -204,6 +229,12 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
       const d = await fetchJobDetail(j);
       withJd.push({ ...j, jd: d.jd });
     } catch (e) {
+      if (e instanceof RateLimitedError) {
+        // 被风控了 —— 别再一条条试了（每条都要等一个安静期）。
+        // 拿到的 JD 照常用，这一轮就按现有的这些跑。
+        log(`  ⚠️ 取 JD 时被风控 —— 停止取剩下的（已取 ${withJd.length} 条）`);
+        break;
+      }
       log(`  ⚠️ ${j.name} 的 JD 取不到：${(e as Error).message}`);
     }
     if ((i + 1) % 10 === 0) log(`  JD 已取 ${i + 1}/${candidates.length}`);
@@ -212,12 +243,15 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
 
   // ⑤ 大模型判断 + 生成文案
   //    缓存命中就不用再问模型 —— 常驻模式下每轮都会遇到同一批岗位
+  //    缓存的钥匙是「岗位 id + 简历指纹」：改了简历，结论就该重算
   const cache = loadJudgeCache();
+  const sig = profileSignature(profile.summary);
   const fresh = withJd.filter(
     (w) =>
       cache[w.jobId] &&
       Date.now() - (cache[w.jobId]!.at ?? 0) < JUDGE_TTL_MS &&
-      cache[w.jobId]!.jobName === w.name,
+      cache[w.jobId]!.jobName === w.name &&
+      cache[w.jobId]!.profileSig === sig,
   );
   const needAsk = withJd.filter((w) => !fresh.includes(w));
 
@@ -246,6 +280,7 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
       cache[j.jobId] = {
         at: Date.now(), jobName: w?.name ?? '', company: w?.company ?? '',
         worth: j.worth, score: j.score, reason: j.reason, greeting: j.greeting,
+        profileSig: sig,
         job: w ? { ...w } : undefined,
       };
     }
@@ -257,6 +292,8 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
     .filter((j) => j.worth && j.greeting)
     .sort((a, b) => b.score - a.score)
     .map((j) => ({ j, job: withJd.find((w) => w.jobId === j.jobId) as unknown as Job }));
+
+  // 不按公司限量 —— 同一家公司的几个 HR 同时收到招呼，他们互不知情（用户 2026-11-15 的判断）
 
   log(`\n════ 大模型判断结果：${worth.length}/${judgements.length} 个值得投 ════`);
   for (const { j, job } of worth) {
@@ -383,13 +420,9 @@ async function main() {
   const dryRun = has('--dry-run');
   const once = has('--once');
   const limit = num('--limit', 0);
-  const query = val('--query');
-  const cityArg = val('--city');
   const pick = val('--pick');
 
   const cfg = loadGreetConfig();
-  if (query) cfg.query = query;
-  const cities = cityArg ? [cityArg] : cfg.cities;
 
   const llm = loadLlmConfig();
   if (!llm) {
@@ -398,8 +431,6 @@ async function main() {
   }
 
   log('════ 主动打招呼 ════');
-  log(`  关键词 : ${cfg.query}`);
-  log(`  城市   : ${cities.map(cityName).join('、')}`);
   log(`  模型   : ${llm.model} @ ${llm.baseUrl}`);
   log(`  干跑   : ${dryRun ? '是（一个字都不发）' : '否（会真的打招呼）'}`);
   if (limit > 0) log(`  本轮上限: ${limit} 个`);
@@ -413,7 +444,7 @@ async function main() {
     return;
   }
 
-  const opts: RoundOpts = { dryRun, limit, cities, pick };
+  const opts: RoundOpts = { dryRun, limit, pick };
 
   if (once || dryRun) {
     try {
