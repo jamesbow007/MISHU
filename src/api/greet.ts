@@ -1,37 +1,11 @@
-/**
- * 主动打招呼 —— 给一个岗位的 HR 发一条定制开场白。
- *
- * 链路（每一步都是一次独立的桥接任务，页面侧只做同步的读/点）：
- *   ① 打开**岗位详情页** → 点「立即沟通」→ 弹出「打招呼」弹窗
- *   ② 等弹窗真的打开（判据：body 上有 dialog-open + 有「发送」按钮）
- *   ③ 把开场白写进 textarea.input-area → 等「发送」解禁 → 点发送
- *   ④ 验证：服务端会话里能看到这条消息（最可靠）
- *
- * ⚠️ **为什么走详情页而不是职位列表**：
- *   列表页 DOM 里只有推荐区那十几个卡片，搜索接口拿到的岗位不在那一页里
- *   （实测点「立即沟通」会报「列表里没有这个岗位」）。详情页对任何来源的岗位都能打开。
- *
- * ⚠️ **「打招呼」弹窗才是能写自定义文案的地方**：
- *   点「立即沟通」不会直接进聊天页，而是弹一个框：
- *     DIV.startchat-content > DIV.edit-area
- *         TEXTAREA.input-area   ← 自定义打招呼语
- *         DIV.send-message      ← 初始带 .disable，输入后才解禁
- *   在聊天页的输入框里写是没用的 —— 那个面板这时候根本没打开。
- *
- * ⚠️ **页面侧一律不等待** —— 跑在后台标签页里，
- *    Chrome 会限流甚至冻结后台页的定时器，await sleep() 会永远挂着，
- *    桥接任务必然 20 秒超时。所有等待都在 Node 侧。
- */
+/** 主动打招呼 —— 在已打开的岗位详情页里给 HR 发一条开场白（流程见 typeAndSend）。 */
 import { type Job } from './jobs.js';
 import { listMessages, listSessions, type ChatSession } from './messages.js';
 import type { BossClient } from './client.js';
-import { closeTabs, runPageFn, runPageFnFull } from './page-transport.js';
+import { runPageFn, runPageFnFull } from './page-transport.js';
 import { sleep } from './util.js';
 
 const POLL_MS = 400;
-const TIMEOUT_DIALOG = 15_000;
-const TIMEOUT_SEND = 12_000;
-const TIMEOUT_CHAT = 25_000;
 
 export interface GreetOutcome {
   ok: boolean;
@@ -44,15 +18,6 @@ export interface GreetOutcome {
   messages?: string[];
 }
 
-const STEP_REASON: Record<string, string> = {
-  'no-chat-btn': '岗位详情页上没有「立即沟通」按钮',
-  'dialog-not-open': '点了「立即沟通」，但「打招呼」弹窗没打开',
-  'no-input': '弹窗里没有自定义输入框',
-  'still-disabled': '输入了内容，但「发送」按钮一直不解禁',
-  'no-send': '弹窗里没有「发送」按钮',
-  'not-sent': '点了发送，但服务端没查到这条消息',
-};
-
 /** 岗位详情页的地址 */
 export function detailUrl(job: Job): string {
   const qs = new URLSearchParams({ securityId: job.securityId, lid: job.lid });
@@ -60,144 +25,213 @@ export function detailUrl(job: Job): string {
 }
 
 /**
- * 本进程开着的标签页（进程被强杀时用来收尾）。
- *
- * 为什么记着：打招呼流程用的是 keep=true 的标签页（要跨好几个任务用同一个），
- * 正常路径在 finally 里关掉了；**进程被 Ctrl+C / kill 时 finally 不会跑**，
- * 那些标签页就成了没人认领的孤儿 —— 攒多了又是标签页泄漏。
+ * 一个岗位的详情页 —— 已经打开、JD 已经在页面里读好了。
  */
-const openTabs = new Set<number>();
-
-/** 关掉本进程开着的所有标签页（退出时调） */
-export async function cleanupGreetTabs(): Promise<number> {
-  const ids = [...openTabs];
-  openTabs.clear();
-  if (!ids.length) return 0;
-  return closeTabs(ids).catch(() => 0);
+export interface JobPage {
+  tabId: number;
+  /** JD 正文（从页面读的，不走接口） */
+  jd: string;
+  /** 页面上读到的岗位名（verify 时以它为准） */
+  name: string;
+  /** 原始岗位 —— 服务端确认要 bossName 等完整身份，别用 `{name} as Job` 伪造 */
+  job: Job;
 }
 
-/** 等「打招呼」弹窗真的打开 */
-async function waitDialog(tabId: number): Promise<{ ok: boolean; state?: any }> {
-  const deadline = Date.now() + TIMEOUT_DIALOG;
-  let last: any = null;
-  for (;;) {
+/**
+ * 打开岗位详情页，把 JD 从**页面里**读出来。
+ *
+ * 为什么不用 job/detail.json 接口：
+ *   详情页本身就渲染了 JD（服务端直出），所以读页面 = 0 次接口请求。
+ *   而接口请求是**最容易被风控卡住的**稀缺资源（实测热了以后 3 分钟才放行 1 个）。
+ *   代价是慢一点（页面加载 3~8 秒 vs 接口 1.4 秒）。
+ *
+ * ⚠️ 页面上的文字和接口返回的一样带「kanzhun」反爬替换（BOSS 故意把词换成这个），
+ *    两边质量一样，所以读页面不吃亏。
+ */
+export async function openJobPage(job: Job, reuseTabId?: number | null): Promise<JobPage> {
+  const read = (opts: Record<string, unknown>) =>
+    runPageFnFull('detail', { mode: 'read' }, { keep: true, timeoutMs: 30_000, ...opts });
+
+  let r: { data: any; tabId: number | null };
+  if (reuseTabId) {
+    // 复用上一个岗位的标签页 → **整轮只开一个页面**，用户看不到一堆页面闪
     try {
-      const st = await runPageFn('greet', { mode: 'state' }, { tabId });
-      last = st;
-      if (st?.dialogOpen && st?.hasSend) return { ok: true, state: st };
-    } catch {
-      /* 页面还在跳转 → 继续等 */
+      r = await read({ tabId: reuseTabId, goto: detailUrl(job) });
+    } catch (e) {
+      // 复用的 tab 可能已死（用户关掉/浏览器回收）—— 不降级的话这个僵尸 id
+      // 会废掉本轮剩下所有岗位（实测过的静默报废链）。降级成新开一个。
+      if (!/标签页不在了/.test((e as Error).message)) throw e;
+      r = await read({ own: true, url: detailUrl(job) });
     }
-    if (Date.now() >= deadline) return { ok: false, state: last };
+  } else {
+    r = await read({ own: true, url: detailUrl(job) });
+  }
+  const d = r.data ?? {};
+  return {
+    tabId: r.tabId!,
+    jd: String(d.jd ?? ''),
+    name: String(d.name ?? job.name),
+    job,
+  };
+}
+
+/**
+ * 把开场白写进去并点发送 —— **不预设走弹窗还是聊天页**。
+ *
+ * 为什么不能在检测到「表面」时就锁死走哪条路（2026-11-15 实测）：
+ *   点完「立即沟通」，弹「打招呼」弹窗和**直接跳聊天页**都可能发生、还可能先后发生 ——
+ *   弹窗刚被检测到、页面就跳走了，对着已不存在的弹窗写 8 秒全失败（no-input）。
+ *   所以：
+ *     ① 先等「能发消息的地方」出现（弹窗 **或** 聊天页，哪个都行）
+ *     ② 写入两边都试 —— 哪边写进用哪边
+ *     ③ 等按钮解禁再点；写着写着页面换了输入框 → 换边重写
+ */
+async function typeAndSend(
+  tabId: number,
+  greeting: string,
+  reClick: () => Promise<void>,
+): Promise<{ ok: boolean; step?: string; detail?: string; convName?: string }> {
+  // ⚠️ 三步**各给各的预算**，不共用一个 deadline。
+  //    之前的教训：弹窗出现得慢（点了 20 多秒才渲染好），
+  //    共用预算时「等表面」把额度吃光，「写入」只剩几秒 ——
+  //    正好在输入框渲染出来之前放弃了（no-input 的真凶）。
+  const surfaceDeadline = Date.now() + 30_000;
+  const TYPE_BUDGET = 15_000;
+  const SEND_BUDGET = 15_000;
+  const startAt = Date.now();
+  let reClicked = false;
+  let mode: 'greet' | 'chat' | null = null;
+  let convName = '';
+
+  // ① 等「能发消息的地方」出现（弹窗 或 聊天页）。
+  //    6 秒没动静 = 点击大概率没生效（页面 JS 未就绪，点击处理器还没挂上）→ 再点一次。
+  //    判据是「两个表面都没出现」这个事实，不是猜时间。
+  //    两个状态查询并发发（各是一次桥接往返，串行白等）。
+  let firstSeen: 'greet' | 'chat' | null = null;
+  for (;;) {
+    const [g, c] = await Promise.all([
+      runPageFn('greet', { mode: 'state' }, { tabId }).catch(() => null),
+      runPageFn('chat', { mode: 'state' }, { tabId }).catch(() => null),
+    ]);
+    if (g?.dialogOpen && g?.hasSend) { firstSeen = 'greet'; break; }
+    if (c?.convName) convName = c.convName;
+    if (c?.boxVisible && c?.hasInput) { firstSeen = 'chat'; break; }
+    if (!reClicked && Date.now() - startAt > 6_000) {
+      await reClick();
+      reClicked = true;
+    }
+    if (Date.now() >= surfaceDeadline) {
+      return { ok: false, step: 'greet-surface-not-ready', detail: '点了按钮，但弹窗和聊天页都没出现', convName };
+    }
     await sleep(POLL_MS);
   }
-}
 
-/** 等聊天页的输入框**可见**（会话真的打开了） */
-async function waitChatReady(tabId: number): Promise<{ ok: boolean; state?: any }> {
-  const deadline = Date.now() + TIMEOUT_CHAT;
-  let last: any = null;
+  // ② 写入 —— 两边都试，哪边写进用哪边（预算从现在起算，不受上一步影响）。
+  //    先试 ① 刚确认的那个表面，别对着不存在的一边白写一发。
+  // 每个表面只写自己的输入框，并回报 surface —— 写进哪个表面，
+  // 就必须用**那个表面**的发送按钮（2026-11-15 的 still-disabled 就是这错配）。
+  const tryType = async (fn: 'greet' | 'chat') => {
+    const r = await runPageFn(fn, { mode: 'type', text: greeting }, { tabId }).catch(() => null);
+    if (!r?.ok) return null;
+    if (r.surface && r.surface !== fn) return null; // 写错地方了 → 不认
+    return r;
+  };
+  const order: Array<'greet' | 'chat'> =
+    firstSeen === 'chat' ? ['chat', 'greet'] : ['greet', 'chat'];
+  const typeDeadline = Date.now() + TYPE_BUDGET;
   for (;;) {
-    try {
-      const st = await runPageFn('chat', { mode: 'state' }, { tabId });
-      last = st;
-      if (st?.boxVisible && st?.hasInput) return { ok: true, state: st };
-    } catch {
-      /* 可能正在跳转 → 继续等 */
+    const a = await tryType(order[0]!);
+    if (a) { mode = order[0]!; if (a.convName) convName = a.convName; break; }
+    const b = await tryType(order[1]!);
+    if (b) { mode = order[1]!; if (b.convName) convName = b.convName; break; }
+    if (Date.now() >= typeDeadline) {
+      // 取证：把失败瞬间的两个状态带回来 —— 不带证据的 no-input 没法修（这次的教训）
+      const [g2, c2] = await Promise.all([
+        runPageFn('greet', { mode: 'state' }, { tabId }).catch(() => null),
+        runPageFn('chat', { mode: 'state' }, { tabId }).catch(() => null),
+      ]);
+      return {
+        ok: false,
+        step: 'no-input',
+        detail:
+          `弹窗和聊天页的输入框都写不进 | ` +
+          `greet{dialog=${g2?.dialogOpen} send=${g2?.hasSend} inputs=${JSON.stringify(g2?.inputs ?? [])} templates=${(g2?.templates ?? []).length}} ` +
+          `chat{input=${c2?.hasInput} 可见=${c2?.boxVisible} url=${String(c2?.url ?? '').slice(-45)}}`,
+        convName,
+      };
     }
-    if (Date.now() >= deadline) return { ok: false, state: last };
+    await sleep(POLL_MS);
+  }
+
+  // ③ 等按钮解禁 → 点发送。等的过程中表面可能被页面换掉 → 换边并重写。
+  const sendDeadline = Date.now() + SEND_BUDGET;
+  for (;;) {
+    const st = await runPageFn(mode, { mode: 'state' }, { tabId }).catch(() => null);
+    // 表面被换掉了（弹窗没了 / 跳走了）→ 状态里没有它 → 换边重写
+    const stillThere =
+      mode === 'greet' ? !!st?.dialogOpen : !!st?.boxVisible;
+    const ready = mode === 'greet' ? st?.sendReady : st?.submitReady;
+    if (ready) {
+      const sent = await runPageFn(mode, { mode: mode === 'greet' ? 'send' : 'submit' }, { tabId }).catch(() => null);
+      if (sent?.ok) return { ok: true, convName };
+      return { ok: false, step: sent?.step ?? 'send-failed', convName };
+    }
+    if (!stillThere) {
+      // 我们那个表面没了（弹窗关了 / 跳到聊天页了）→ 字得在新的表面上重写
+      const other: 'greet' | 'chat' = mode === 'greet' ? 'chat' : 'greet';
+      const os = await runPageFn(other, { mode: 'state' }, { tabId }).catch(() => null);
+      const there = other === 'greet' ? os?.dialogOpen && os?.hasSend : os?.boxVisible && os?.hasInput;
+      if (there) {
+        const t: any = await runPageFn(other, { mode: 'type', text: greeting }, { tabId }).catch(() => null);
+        if (t?.ok && (!t.surface || t.surface === other)) {
+          mode = other;
+          if (t.convName) convName = t.convName;
+        }
+      }
+    }
+    if (Date.now() >= sendDeadline) {
+      return { ok: false, step: 'still-disabled', detail: '输入了内容，但发送按钮一直不解禁', convName };
+    }
     await sleep(POLL_MS);
   }
 }
 
 /**
- * 给一个岗位的 HR 发一条消息。
+ * 在**已经打开的**详情页里，给这个 HR 发一条消息。
  *
- * greeting 是大模型生成的开场白（已经截到 300 字符以内）。
- *
- * verify：发完之后怎么确认「真的发出去了」。
- *   服务端会话列表最可靠（页面 DOM 的消息列表选择器不可靠）；
- *   没有 verify 回调就只做页面侧的尽力确认。
+ * 只做两件事：点按钮（「立即沟通」/「继续沟通」是同一个按钮，文案不同），
+ * 然后把剩下的交给 typeAndSend（它自己判断弹窗还是聊天页，两边都试）。
  */
-export async function greetOne(
-  job: Job,
+export async function greetInPage(
+  page: JobPage,
   greeting: string,
   verify?: (job: Job, greeting: string) => Promise<boolean>,
 ): Promise<GreetOutcome> {
   const out: GreetOutcome = { ok: false };
-  let ownTabId: number | null = null;
+  // 以页面读到的岗位名为准，但保留 bossName 等完整身份 —— verify 靠它按人匹配
+  const job: Job = { ...page.job, name: page.name };
 
   try {
-    // ① 打开岗位详情页，点「立即沟通」（keep → 标签页留着，后面几步都用它）
-    const clicked = await runPageFnFull(
-      'detail',
-      { mode: 'chat-click' },
-      { own: true, url: detailUrl(job), keep: true, timeoutMs: 25_000 },
-    );
-    ownTabId = clicked.tabId;
-    if (ownTabId) openTabs.add(ownTabId);
-    if (!clicked.data?.ok) {
-      out.step = clicked.data?.step ?? 'no-chat-btn';
-      out.detail = clicked.data?.detail;
+    // 点「立即沟通 / 继续沟通」。
+    // ⚠️ 点击可能没生效（页面 JS 未就绪）—— typeAndSend 里靠「表面没出现」再点一次
+    const clicked = await runPageFn('detail', { mode: 'chat-click' }, { tabId: page.tabId });
+    if (!clicked?.ok) {
+      out.step = clicked?.step ?? 'no-chat-btn';
       return out;
     }
 
-    // ② 分两条路：
-    //    「继续沟通」= 已经聊过 → 点完直接进聊天页 → 在聊天输入框里发
-    //    「立即沟通」= 第一次   → 点完弹「打招呼」弹窗 → 在弹窗里发
-    const alreadyTalked = !!clicked.data?.alreadyTalked;
-
-    if (alreadyTalked) {
-      const ready = await waitChatReady(ownTabId!);
-      if (!ready.ok) {
-        out.step = 'chat-not-open';
-        out.detail = '点了「继续沟通」，但聊天页的输入框没出现';
-        return out;
-      }
-      out.convName = ready.state?.convName;
-
-      const typed = await runPageFn('chat', { mode: 'type', text: greeting }, { tabId: ownTabId! });
-      if (!typed?.ok) {
-        out.step = typed?.step ?? 'no-input';
-        out.detail = typed?.detail;
-        return out;
-      }
-      if (!(await waitSubmitReady(ownTabId!))) {
-        out.step = 'still-disabled';
-        out.detail = '输入框里的内容没被页面认下（value 改了但 Vue 模型没更新）';
-        return out;
-      }
-      const sent = await runPageFn('chat', { mode: 'submit' }, { tabId: ownTabId! });
-      if (!sent?.ok) {
-        out.step = sent?.step ?? 'no-submit';
-        return out;
-      }
-    } else {
-      const dlg = await waitDialog(ownTabId!);
-      if (!dlg.ok) {
-        out.step = 'dialog-not-open';
-        out.detail = '点了「立即沟通」，弹窗没打开（页面可能还在跳转）';
-        return out;
-      }
-
-      const typed = await runPageFn('greet', { mode: 'type', text: greeting }, { tabId: ownTabId! });
-      if (!typed?.ok) {
-        out.step = typed?.step ?? 'no-input';
-        return out;
-      }
-      if (!(await waitSendReady(ownTabId!))) {
-        out.step = 'still-disabled';
-        out.detail = '输入框里的内容没被页面认下（value 改了但 Vue 模型没更新）';
-        return out;
-      }
-      const sent = await runPageFn('greet', { mode: 'send' }, { tabId: ownTabId! });
-      if (!sent?.ok) {
-        out.step = sent?.step ?? 'no-send';
-        return out;
-      }
+    const r = await typeAndSend(page.tabId, greeting, async () => {
+      await runPageFn('detail', { mode: 'chat-click' }, { tabId: page.tabId }).catch(() => null);
+    });
+    if (!r.ok) {
+      out.step = r.step;
+      out.detail = r.detail;
+      out.convName = r.convName;
+      return out;
     }
+    out.convName = r.convName;
 
-    // ③ 验证
+    // 服务端确认
     if (verify) {
       const ok = await verify(job, greeting);
       if (!ok) {
@@ -214,46 +248,8 @@ export async function greetOne(
     out.step = out.step ?? 'error';
     out.detail = (e as Error).message;
     return out;
-  } finally {
-    // 自己开的标签页用完要收掉（不然会攒出一堆页面）
-    if (ownTabId) {
-      openTabs.delete(ownTabId);
-      await closeTabs([ownTabId]).catch(() => {});
-    }
   }
 }
-
-/** 等「发送」解禁（有内容才解禁）—— 等状态，不等固定时长 */
-async function waitSendReady(tabId: number): Promise<boolean> {
-  const deadline = Date.now() + TIMEOUT_SEND;
-  for (;;) {
-    try {
-      const st = await runPageFn('greet', { mode: 'state' }, { tabId });
-      if (st?.sendReady) return true;
-    } catch {
-      /* ignore */
-    }
-    if (Date.now() >= deadline) return false;
-    await sleep(POLL_MS);
-  }
-}
-
-/** 等聊天页的「提交」解禁 */
-async function waitSubmitReady(tabId: number): Promise<boolean> {
-  const deadline = Date.now() + TIMEOUT_SEND;
-  for (;;) {
-    try {
-      const st = await runPageFn('chat', { mode: 'state' }, { tabId });
-      if (st?.submitReady) return true;
-    } catch {
-      /* ignore */
-    }
-    if (Date.now() >= deadline) return false;
-    await sleep(POLL_MS);
-  }
-}
-
-export { STEP_REASON };
 
 /* ---------------- 服务端确认 ---------------- */
 

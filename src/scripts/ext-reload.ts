@@ -21,6 +21,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { bridge, bridgeStatus } from '../api/bridge.js';
@@ -31,9 +32,33 @@ const BG = path.join(ROOT, 'extension', 'background.js');
 
 const sha256 = (text: string) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 
+/**
+ * 语法检查 —— **必须在把代码推给扩展之前**。
+ *
+ * 为什么这道检查值得加：
+ *   background.js 一旦有语法错误，扩展的 service worker **直接起不来**，
+ *   而 Chrome 还会把这份坏文件**缓存住** —— 之后连「SW 停了再启动」都读不回磁盘，
+ *   只能去 chrome://extensions/ 手动点「🔄 重新加载」才能救回来。
+ *   （这个坑 2026-11-15 实测踩过一次：一句 await 写在了非 async 函数里。）
+ */
+function checkSyntax(): void {
+  try {
+    execFileSync(process.execPath, ['--check', BG], { stdio: 'pipe' });
+  } catch (e: any) {
+    const out = `${e?.stderr ?? ''}${e?.stdout ?? ''}`.trim();
+    console.error('❌ extension/background.js 语法有问题 —— **没有推给扩展**（推了扩展就起不来了）');
+    console.error(out.split('\n').slice(0, 8).join('\n'));
+    console.error('\n改好再跑一次 npm run ext:reload。');
+    process.exit(1);
+  }
+}
+
 async function main() {
   // 扩展的诊断信息刷屏 —— 关掉
   process.env.BOSS_ZHIPIN_QUIET_DIAG = '1';
+
+  // ⓪ 语法先过一遍 —— 坏代码绝不能推给扩展
+  checkSyntax();
 
   await bridge.start();
 
@@ -47,7 +72,10 @@ async function main() {
     await sleep(500);
   }
   if (!connected) {
-    console.error('❌ 扩展没连上本地桥接 —— 检查 chrome://extensions/ 里扩展是否被停用');
+    console.error('❌ 扩展没连上本地桥接。可能是这几种情况：');
+    console.error('   ① chrome://extensions/ 里扩展被停用了 → 点「🔄 重新加载」');
+    console.error('   ② 扩展的 background.js 有语法错误 → SW 起不来（改完先跑 node --check extension/background.js）');
+    console.error('   ③ 端口 39115 被别的进程占着 → 那个僵尸桥接把扩展的任务都吃掉了');
     process.exit(1);
   }
 

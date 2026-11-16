@@ -50,6 +50,8 @@ interface JdCacheEntry {
   jd: string;
   address: string;
   bossName: string;
+  /** HR 的唯一 id（encryptBossId）—— 去重要按「人」而不是按「岗位」 */
+  bossId: string;
   bossTitle: string;
   activeTime: string;
   company: string;
@@ -140,6 +142,8 @@ export interface Job {
   industry: string;
   /** HR */
   bossName: string;
+  /** HR 的唯一 id（encryptBossId）—— 去重要按「人」而不是按「岗位」 */
+  bossId: string;
   bossTitle: string;
   /** 技能标签 */
   tags: string[];
@@ -166,6 +170,8 @@ export interface JobDetail {
   jd: string;
   address: string;
   bossName: string;
+  /** HR 的唯一 id（encryptBossId）—— 去重要按「人」而不是按「岗位」 */
+  bossId: string;
   bossTitle: string;
   activeTime: string;
   company: string;
@@ -191,6 +197,7 @@ function toJob(raw: any, source: 'recommend' | 'search', expectLabel?: string): 
     stage: String(raw?.brandStageName ?? ''),
     industry: String(raw?.brandIndustry ?? ''),
     bossName: String(raw?.bossName ?? ''),
+    bossId: String(raw?.encryptBossId ?? ''),
     bossTitle: String(raw?.bossTitle ?? ''),
     tags: Array.isArray(raw?.jobLabels) ? raw.jobLabels.map((t: any) => String(t?.name ?? t)).filter(Boolean) : [],
     welfare: Array.isArray(raw?.welfareList) ? raw.welfareList.map((t: any) => String(t?.name ?? t)) : [],
@@ -264,6 +271,7 @@ export async function fetchJobDetail(job: Job): Promise<JobDetail> {
       jd: hit.jd,
       address: hit.address,
       bossName: hit.bossName,
+      bossId: String(hit.bossId ?? job.bossId ?? ''),
       bossTitle: hit.bossTitle,
       activeTime: hit.activeTime,
       company: hit.company,
@@ -285,6 +293,7 @@ export async function fetchJobDetail(job: Job): Promise<JobDetail> {
     jd: String(ji.postDescription ?? ''),
     address: String(ji.address ?? ji.locationName ?? ''),
     bossName: String(bi.name ?? job.bossName),
+    bossId: String(bi.encryptFriendId ?? bi.bossId ?? job.bossId ?? ''),
     bossTitle: String(bi.title ?? job.bossTitle),
     activeTime: String(bi.activeTimeDesc ?? ''),
     company: String(ci.brandName ?? job.company),

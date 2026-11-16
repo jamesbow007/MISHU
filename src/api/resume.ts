@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 
-import { closeTabs, runPageFnFull } from './page-transport.js';
+import { closeTabsOpenedSince, runPageFnFull, tabIdsSnapshot } from './page-transport.js';
 import { sleep } from './util.js';
 
 export const RESUME_URL = 'https://www.zhipin.com/web/geek/resume';
@@ -69,19 +69,29 @@ export async function readMyProfile(): Promise<MyProfile> {
   let tabId: number | null = null;
   let r: any = null;
 
+  // 开页面前拍个快照 —— 读完把「这次新出现的标签页」全关掉
+  // （实测一次调用会多开一个同样地址的页面，只关自己那个就会漏）
+  const tabsBefore = await tabIdsSnapshot();
+
   for (;;) {
     const res: any = await runPageFnFull(
       'resume',
       { mode: 'read' },
       { url: RESUME_URL, own: true, keep: true, tabId: tabId ?? undefined },
-    ).catch(() => null);
+    ).catch((e: any) => {
+      // 失败时也要记住 tabId —— 否则这个标签页永远关不掉（泄漏）。
+      // 扩展的错误信封里现在会带 tabId。
+      if (e?.tabId) tabId = e.tabId;
+      return null;
+    });
     tabId = res?.tabId ?? tabId;
     r = res?.data ?? null;
     if (r?.ok && (r.blocks?.length ?? 0) > 0) break;
     if (Date.now() >= deadline) break;
     await sleep(500);
   }
-  if (tabId) await closeTabs([tabId]).catch(() => {});
+  // 关掉这次新出现的所有标签页（我们自己开的 + 多出来那个）
+  await closeTabsOpenedSince(tabsBefore).catch(() => {});
   if (!r?.ok) throw new Error('读简历失败：' + (r?.error ?? '未知原因'));
 
   const info = r.info ?? {};

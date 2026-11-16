@@ -187,7 +187,7 @@ export async function runPageFn(
 export async function runPageFnFull(
   fnName: string,
   arg: any,
-  opts: Parameters<typeof runPageFn>[2] = {},
+  opts: Parameters<typeof runPageFn>[2] & { goto?: string } = {},
 ): Promise<{ data: any; tabId: number | null }> {
   const payload = await bridge.runTask(
     {
@@ -200,12 +200,20 @@ export async function runPageFnFull(
       own: opts.own,
       keep: opts.keep,
       tabId: opts.tabId,
+      // 复用已有的标签页时，导航到新地址（而不是新开一个）
+      goto: opts.goto,
       waitMs: 1500,
     },
     opts.timeoutMs ?? BRIDGE_TASK_TIMEOUT_MS + 5_000,
   );
   if (!payload) throw new Error('扩展没有返回结果');
-  if (payload.ok === false) throw new Error(payload.error || '页面函数执行失败');
+  if (payload.ok === false) {
+    // 错误也要把 tabId 带出去 —— 调用方可能刚开了个标签页，
+    // 拿不到 id 就关不掉它（标签页泄漏）。
+    const err = new Error(payload.error || '页面函数执行失败') as Error & { tabId?: number | null };
+    err.tabId = payload.tabId ?? null;
+    throw err;
+  }
   return { data: payload.data ?? null, tabId: payload.tabId ?? null };
 }
 
@@ -306,6 +314,38 @@ export async function closeTabs(tabIds: number[]): Promise<number> {
     '关闭标签页',
   );
   return Number(r?.closed ?? 0);
+}
+
+/**
+ * 当前的标签页 id 列表（快照）。
+ *
+ * 用来「关掉这次打开的标签页」：开页面前拍个快照，做完再拍一次，
+ * **差集**就是这次新出现的 —— 全关掉。
+ *
+ * 为什么不用「用完直接关自己那个」：
+ *   实测简历页那次调用会**多开一个**同样地址的标签页（不知道是谁开的，
+ *   但它确实存在），只关自己那个的话，每读一次简历就漏一个页面，
+ *   跑久了又是一堆标签页（以前踩过 8 小时攒几百个的坑）。
+ */
+export async function tabIdsSnapshot(): Promise<number[]> {
+  try {
+    const info = await listChatTabs();
+    return (info?.tabs ?? []).map((t) => t.id);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 关掉「相对于 before 新出现」的标签页。
+ *
+ * 用户自己开着的标签页不在差集里，不受影响。
+ */
+export async function closeTabsOpenedSince(before: number[]): Promise<number> {
+  const after = await tabIdsSnapshot();
+  const extra = after.filter((id) => !before.includes(id));
+  if (!extra.length) return 0;
+  return closeTabs(extra);
 }
 
 /**

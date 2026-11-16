@@ -1,9 +1,9 @@
 {
   "name": "mishu",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "常驻自动投递：后台挂着，扫「新招呼」里带红点的会话，自动发附件简历",
+  "description": "BOSS直聘个人助手：自动投递附件简历 + 主动打招呼（大模型逐条写开场白）",
   "engines": {
     "node": ">=20"
   },

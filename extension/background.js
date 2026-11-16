@@ -421,12 +421,25 @@ async function runPageTask(taskId, task) {
           tab = t;
           reused = true; // 不是我们开的，不能关
         } else {
-          send({ ok: false, error: '标签页不在了：' + task.tabId });
+          send({ ok: false, error: '标签页不在了：' + task.tabId, tabId: tab?.id ?? task.tabId });
           return;
         }
       } catch (e) {
-        send({ ok: false, error: '标签页不在了：' + task.tabId });
+        send({ ok: false, error: '标签页不在了：' + task.taskId, tabId: task.tabId });
         return;
+      }
+
+      // **把这个标签页导航到别的地址** ——
+      // 「一个标签页来回用」的关键：不每个岗位都新开一个（用户看到一堆页面闪来闪去）。
+      if (task.goto) {
+        try {
+          await chrome.tabs.update(tab.id, { url: task.goto });
+          await waitForTabLoad(tab.id, PAGE_LOAD_BUDGET_MS);
+          tab = await chrome.tabs.get(tab.id);
+        } catch (e) {
+          send({ ok: false, error: '标签页导航失败：' + String((e && e.message) || e), tabId: tab.id });
+          return;
+        }
       }
     }
 
@@ -501,7 +514,7 @@ async function runPageTask(taskId, task) {
       try {
         const fn = task.fn ? getPageFn(task.fn) : task.actions ? domActions : domProbe;
         if (!fn) {
-          send({ ok: false, error: '未知页面函数：' + task.fn });
+          send({ ok: false, error: '未知页面函数：' + task.fn, tabId: tab?.id ?? null });
           return;
         }
         const arg = task.fn ? task.arg ?? {} : task.actions ? task.actions : task.probe || 'unread';
@@ -514,7 +527,7 @@ async function runPageTask(taskId, task) {
         // 调用方得知道去哪个标签页里发消息
         send({ ok: true, data: out?.[0]?.result ?? null, tabId: tab.id ?? null });
       } catch (e) {
-        send({ ok: false, error: 'DOM 操作失败：' + String((e && e.message) || e) });
+        send({ ok: false, error: 'DOM 操作失败：' + String((e && e.message) || e), tabId: tab?.id ?? null });
       }
       return;
     }
@@ -532,14 +545,16 @@ async function runPageTask(taskId, task) {
         await new Promise((r) => setTimeout(r, 400));
         res = await chrome.tabs.sendMessage(tab.id, { type: 'extract' });
       } catch (e2) {
-        send({ ok: false, error: '提取失败：' + String((e2 && e2.message) || e2) });
+        send({ ok: false, error: '提取失败：' + String((e2 && e2.message) || e2), tabId: tab?.id ?? null });
         return;
       }
     }
 
-    send(res && res.ok ? res : { ok: false, error: '页面没有返回内容' });
+    send(res && res.ok ? res : { ok: false, error: '页面没有返回内容', tabId: tab?.id ?? null });
   } catch (e) {
-    send({ ok: false, error: String((e && e.message) || e) });
+    // ⚠️ 错误信封必须带 tabId —— 调用方可能刚开了个标签页，
+    //    拿不到 id 就关不掉它（标签页泄漏）。
+    send({ ok: false, error: String((e && e.message) || e), tabId: tab?.id ?? null });
   } finally {
     // 固定标签页不能关（守护进程还要用）；task.keep = 留着别关（调用方自己管）
     const closedTab = tab && tab.id && !reused && !task.pin && !task.keep;
@@ -882,6 +897,61 @@ function getPageFn(name) {
 function pageGreetTask(arg) {
   const A = arg || {};
   const mode = A.mode || 'state';
+  /**
+   * 把文字写进输入框，并让 Vue 知道。
+   *
+   * ⚠️ **必须是函数内的局部定义**：本函数会被 executeScript 序列化后注入页面，
+   *    注入的只有函数自己的源码 —— 引用模块级函数在页面里是 ReferenceError，
+   *    而且表现为**静默的 null**（executeScript 不报错，结果直接没了）。
+   *    2026-11-15 实测：type 模式调了模块级的 writeInto → 一整晚 no-input。
+   *
+   * - contenteditable 的 div（新版聊天页的 #chat-input）：设 textContent
+   * - textarea：走原生 value setter（直接赋值 Vue 的 v-model 收不到）
+   * 两种都要再派发 input / change 事件。
+   */
+  const writeInto = (el, text) => {
+    if (el.isContentEditable) {
+      // contenteditable（聊天页的 #chat-input）：**用 execCommand 插入**。
+      //
+      // 为什么不能只设 textContent + input 事件：
+      //   BOSS 聊天框是自家编辑器，它认的是「真的编辑动作」——
+      //   execCommand('insertText') 会派发 beforeinput/input（带正确的数据），
+      //   而合成的 input 事件它不一定接 → 文字进去了，发送按钮却不解禁
+      //   （2026-11-15 实测：24/100 次失败都是 still-disabled）。
+      //   execCommand 失败再退回 textContent + input。
+      let inserted = false;
+      try {
+        el.focus();
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        inserted = document.execCommand('insertText', false, text);
+      } catch (e) {
+        inserted = false;
+      }
+      if (!inserted || !el.textContent) {
+        el.textContent = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
+    try {
+      const proto = Object.getPrototypeOf(el);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(el, text);
+    } catch (e) {
+      el.value = text;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+
+
   const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
   const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
   const out = { mode, ok: false, step: mode, at: Date.now() };
@@ -934,28 +1004,25 @@ function pageGreetTask(arg) {
   }
 
   if (mode === 'type') {
-    // 优先用弹窗里那个 textarea.input-area（自定义打招呼语）——
-    // 页面上还有搜索框等别的 input，别写错地方
-    const el =
-      document.querySelector('textarea.input-area') ||
-      Array.from(document.querySelectorAll('textarea')).filter(visible)[0] ||
-      Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible)[0] ||
-      null;
-    if (!el) {
+    // ⚠️ **只认弹窗自己的输入框**（textarea.input-area），不许回退到别的框。
+    //
+    // 2026-11-15 实测的 bug：原来这里有一串 fallback（任意可见 textarea →
+    // 任意可见 contenteditable）。弹窗刚被检测到、页面就跳到聊天页时，
+    // 文字被写进了**聊天页的输入框**，但调用方以为写的是弹窗 → 去等弹窗的
+    // 「发送」解禁 → 那个按钮从没被写过 → 永远不解禁（still-disabled），
+    // 而且那句话还留在聊天输入框里没发出去。
+    //
+    // 现在各写各的，并回报 surface，调用方只认匹配的那个。
+    const el = document.querySelector('textarea.input-area');
+    if (!el || !visible(el)) {
       out.ok = false;
       out.step = 'no-input';
+      out.surface = 'greet';
       return out;
     }
+    out.surface = 'greet';
     const text = String(A.text ?? '');
-    try {
-      const proto = Object.getPrototypeOf(el);
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-      setter.call(el, text);
-    } catch (e) {
-      el.value = text;
-    }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    writeInto(el, text);
     out.ok = true;
     out.step = 'typed';
     out.value = String(el.value ?? '');
@@ -1014,7 +1081,7 @@ function pageDetailTask(arg) {
     return list[0] || null;
   };
 
-  if (mode === 'scan' || mode === 'chat-click') {
+  if (mode === 'scan' || mode === 'chat-click' || mode === 'read') {
     const banner = document.querySelector('.job-banner');
     const btn = chatBtn();
     out.name = txt(banner && banner.querySelector('.name, .job-name'));
@@ -1030,6 +1097,19 @@ function pageDetailTask(arg) {
     // 点完会跳到哪 —— 消息页的地址在按钮上写着
     out.redirectUrl = btn ? String(btn.getAttribute('redirect-url') || '') : '';
     out.url = location.href;
+
+    if (mode === 'read') {
+      // JD 正文：页面顺序是「职位描述 → 公司介绍 → 竞争力分析 → 更多职位」，
+      // 所以第一个 .job-sec-text 就是 JD（第二个是公司介绍）。
+      const texts = Array.from(document.querySelectorAll('.job-sec-text'))
+        .map((e) => txt(e))
+        .filter((t) => t.length > 40);
+      out.jd = texts[0] ?? '';
+      out.jdLen = out.jd.length;
+      out.ok = true;
+      out.step = 'read';
+      return out;
+    }
 
     if (mode === 'scan') {
       out.ok = true;
@@ -1074,13 +1154,96 @@ function pageDetailTask(arg) {
 function pageChatTask(arg) {
   const A = arg || {};
   const mode = A.mode || 'state';
+  /**
+   * 把文字写进输入框，并让 Vue 知道。
+   *
+   * ⚠️ **必须是函数内的局部定义**：本函数会被 executeScript 序列化后注入页面，
+   *    注入的只有函数自己的源码 —— 引用模块级函数在页面里是 ReferenceError，
+   *    而且表现为**静默的 null**（executeScript 不报错，结果直接没了）。
+   *    2026-11-15 实测：type 模式调了模块级的 writeInto → 一整晚 no-input。
+   *
+   * - contenteditable 的 div（新版聊天页的 #chat-input）：设 textContent
+   * - textarea：走原生 value setter（直接赋值 Vue 的 v-model 收不到）
+   * 两种都要再派发 input / change 事件。
+   */
+  const writeInto = (el, text) => {
+    if (el.isContentEditable) {
+      // contenteditable（聊天页的 #chat-input）：**用 execCommand 插入**。
+      //
+      // 为什么不能只设 textContent + input 事件：
+      //   BOSS 聊天框是自家编辑器，它认的是「真的编辑动作」——
+      //   execCommand('insertText') 会派发 beforeinput/input（带正确的数据），
+      //   而合成的 input 事件它不一定接 → 文字进去了，发送按钮却不解禁
+      //   （2026-11-15 实测：24/100 次失败都是 still-disabled）。
+      //   execCommand 失败再退回 textContent + input。
+      let inserted = false;
+      try {
+        el.focus();
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        inserted = document.execCommand('insertText', false, text);
+      } catch (e) {
+        inserted = false;
+      }
+      if (!inserted || !el.textContent) {
+        el.textContent = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
+    try {
+      const proto = Object.getPrototypeOf(el);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(el, text);
+    } catch (e) {
+      el.value = text;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+
+
   const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
   const out = { mode, ok: false, step: mode, at: Date.now() };
 
-  /** 输入框（聊天页的输入框在 .input-box 里；简历弹窗里也有 .btn-sure-v2，别搞混） */
+  /**
+   * 聊天页的输入框 —— **有两个**，别搞错：
+   *   DIV#chat-input.chat-input  contenteditable  ← 真正能用的（新版聊天页）
+   *   DIV.input-box > textarea.input                ← 旧版残留，**一直隐藏**
+   * 早期对着后者写，怎么都写不进去（消息发不出去就是这个原因）。
+   */
   const inputBox = () => document.querySelector('.input-box');
-  const textarea = () => document.querySelector('.input-box textarea.input, textarea.input');
-  const submitBtn = () => document.querySelector('.input-box .btn-sure-v2, .input-box .btn-v2');
+  // ⚠️ 只认**聊天页自己的**输入框：#chat-input（新版）或 .input-box 里的旧版 textarea。
+  //    不能拿「任意可见 textarea」—— 详情页/弹窗里也有 textarea，会写错地方。
+  const textarea = () => {
+    const real = document.querySelector('#chat-input.chat-input');
+    if (real && visible(real)) return real;
+    return (
+      Array.from(document.querySelectorAll('.input-box textarea.input')).filter(visible)[0] ?? null
+    );
+  };
+  /**
+   * 聊天页的「发送」按钮 —— **必须挑可见的那个**。
+   *
+   * ⚠️ 聊天页里有两个发送按钮：
+   *    button.btn-send            ← 新的，真按钮
+   *    .input-box .btn-sure-v2    ← 旧版残留，**一直 hidden、一直带 disabled 类**
+   *  用 querySelector（逗号列表按文档顺序取第一个匹配）会拿到**那个隐藏的旧按钮**
+   *  → submitReady 永远是 false（2026-11-15 实测：24/100 次失败都是 still-disabled）
+   *  → 而且点发送也是点它，等于什么都没发。
+   */
+  const submitBtn = () => {
+    const cands = Array.from(
+      document.querySelectorAll('button.btn-send, .input-box .btn-sure-v2, .input-box .btn-v2'),
+    );
+    return cands.find(visible) ?? null;
+  };
   const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
 
   if (mode === 'state') {
@@ -1091,7 +1254,7 @@ function pageChatTask(arg) {
     out.hasBox = !!inputBox();
     // ⚠️ **可见性很关键**：消息页没打开会话时，输入框在 DOM 里但**是隐藏的**
     //    （那时候往里写字是白写 —— 消息根本没地方发）。
-    out.boxVisible = !!(inputBox() && visible(inputBox()));
+    out.boxVisible = !!(ta && visible(ta));
     out.value = ta ? String(ta.value || '') : '';
     out.submitExists = !!btn;
     // 提交按钮是「有内容才解禁」的 —— 解禁了才能点
@@ -1111,6 +1274,8 @@ function pageChatTask(arg) {
   }
 
   if (mode === 'type') {
+    // ⚠️ 页面函数保持同步 —— **等待一律放 Node 侧**（页面里的 await 在
+    //    后台标签页会被冻结，而且这里本来就不是 async 函数）。
     const ta = textarea();
     if (!ta || !visible(ta)) {
       out.ok = false;
@@ -1119,20 +1284,11 @@ function pageChatTask(arg) {
       return out;
     }
     const text = String(A.text ?? '');
-    // Vue 的 v-model 靠 input 事件同步 —— 直接改 .value 它不知道，
-    // 所以要走原生 setter 再派发 input/change（改 value 这个动作本身是「伪造」的）
-    try {
-      const proto = Object.getPrototypeOf(ta);
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-      setter.call(ta, text);
-    } catch (e) {
-      ta.value = text;
-    }
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
-    ta.dispatchEvent(new Event('change', { bubbles: true }));
+    writeInto(ta, text);
     out.ok = true;
     out.step = 'typed';
-    out.value = String(ta.value || '');
+    out.surface = 'chat';
+    out.value = ta.isContentEditable ? String(ta.textContent || '') : String(ta.value || '');
     const btn = submitBtn();
     out.submitReady = !!btn && !/disabled/.test(String(btn.className || ''));
     return out;
@@ -1305,7 +1461,7 @@ function pageJobsTask(arg) {
     }
     out.ok = true;
     out.step = 'requests';
-    out.urls = urls.slice(-40);
+    out.urls = urls.slice(-150);
     return out;
   }
 

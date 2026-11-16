@@ -19,12 +19,15 @@ import { bridge, bridgeStatus } from '../api/bridge.js';
 import { createBrowserClient } from '../api/browser-client.js';
 import { loadGreetConfig, type GreetConfig } from '../api/greet-config.js';
 import {
-  cleanupGreetTabs,
-  greetOne,
+  greetInPage,
+  openJobPage,
   verifyGreeting,
+  type JobPage,
 } from '../api/greet.js';
+import { closeTabs, closeTabsOpenedSince, tabIdsSnapshot } from '../api/page-transport.js';
 import { listSessions } from '../api/messages.js';
 import {
+  backfillBosses,
   greetedRecently,
   JUDGE_TTL_MS,
   loadGreetState,
@@ -174,13 +177,16 @@ async function loadExpects(): Promise<Awaited<ReturnType<typeof listExpects>>> {
  *   那是大模型的活，不是几个字段能判的。
  *   所以这里只保留去重（别再打扰同一个 HR），其余全交给模型。
  */
-function filterJobs(jobs: Job[], cfg: GreetConfig): { kept: Job[]; dropped: Record<string, number> } {
+function filterJobs(
+  jobs: Job[],
+  cfg: GreetConfig,
+  state: ReturnType<typeof loadGreetState>,
+): { kept: Job[]; dropped: Record<string, number> } {
   const dropped: Record<string, number> = { 已联系过: 0 };
-  const state = loadGreetState();
   const kept: Job[] = [];
 
   for (const j of jobs) {
-    if (greetedRecently(state, j.jobId, cfg.cooldownDays)) {
+    if (greetedRecently(state, j.jobId, cfg.cooldownDays, j.bossId)) {
       dropped['已联系过']!++;
       continue;
     }
@@ -213,166 +219,201 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
   log(`  合计 ${all.length} 条（去重后）`);
 
   // ③ 粗筛（只挡已经联系过的；其余交给大模型按简历和 JD 判）
-  const { kept, dropped } = filterJobs(all, cfg);
+  //    判断和记账用同一份 state，别加载两份
+  const { kept, dropped } = filterJobs(all, cfg, state);
+
+  // 老记录的 bossId 回填（幂等迁移）—— 逻辑收在 greet-state.ts
+  backfillBosses(state, all);
+  saveGreetState(state);
   const dropTxt = Object.entries(dropped).filter(([, n]) => n > 0).map(([k, n]) => `${k}${n}`).join(' ');
   log(`  粗筛后 ${kept.length} 条${dropTxt ? `（去掉：${dropTxt}）` : ''}`);
 
-  // ④ 取 JD
-  const candidates = kept.slice(0, cfg.candidates);
-  if (kept.length > candidates.length) {
-    log(`  只取前 ${candidates.length} 条取 JD（配置 candidates）`);
-  }
-  const withJd: (Job & { jd: string })[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const j = candidates[i]!;
-    try {
-      const d = await fetchJobDetail(j);
-      withJd.push({ ...j, jd: d.jd });
-    } catch (e) {
-      if (e instanceof RateLimitedError) {
-        // 被风控了 —— 别再一条条试了（每条都要等一个安静期）。
-        // 拿到的 JD 照常用，这一轮就按现有的这些跑。
-        log(`  ⚠️ 取 JD 时被风控 —— 停止取剩下的（已取 ${withJd.length} 条）`);
-        break;
-      }
-      log(`  ⚠️ ${j.name} 的 JD 取不到：${(e as Error).message}`);
-    }
-    if ((i + 1) % 10 === 0) log(`  JD 已取 ${i + 1}/${candidates.length}`);
-  }
-  log(`  拿到 JD ${withJd.length} 条`);
-
-  // ⑤ 大模型判断 + 生成文案
-  //    缓存命中就不用再问模型 —— 常驻模式下每轮都会遇到同一批岗位
-  //    缓存的钥匙是「岗位 id + 简历指纹」：改了简历，结论就该重算
+  // ④⑤⑥ 逐个来：一个岗位一个岗位地处理
+  //
+  //   取这个岗位的 JD → 让模型判值不值得投 → 值得就马上打招呼 → 不值得就下一个
+  //
+  // 为什么不是「先把 30 个 JD 都取了、再批量判、最后统一发」：
+  //   - **省请求**：判断缓存命中就直接跳过，连 JD 都不用取
+  //   - **出结果快**：第一个招呼在第一次模型调用之后就能发出去，
+  //     而不是等 10 批模型全跑完
+  //   - **撞风控时不白干**：已经打过招呼的那几个不会因为后面被挡而丢掉
+  //
+  //   缓存的钥匙 = 岗位 id + 简历指纹：岗位没变、简历没变 → 直接用旧结论；
+  //   简历改了 → 指纹对不上 → 重新判断。
   const cache = loadJudgeCache();
   const sig = profileSignature(profile.summary);
-  const fresh = withJd.filter(
-    (w) =>
-      cache[w.jobId] &&
-      Date.now() - (cache[w.jobId]!.at ?? 0) < JUDGE_TTL_MS &&
-      cache[w.jobId]!.jobName === w.name &&
-      cache[w.jobId]!.profileSig === sig,
-  );
-  const needAsk = withJd.filter((w) => !fresh.includes(w));
-
-  const judgements: Judgement[] = [];
-  if (fresh.length) {
-    log(`判断结果缓存命中 ${fresh.length} 条（24 小时内算新鲜）`);
-    for (const w of fresh) {
-      const c = cache[w.jobId]!;
-      // 老缓存里没存岗位元数据 → 顺手补上（下次 --pick 就能用）
-      if (!c.job) c.job = { ...w };
-      judgements.push({
-        jobId: w.jobId, worth: c.worth, score: c.score, reason: c.reason, greeting: c.greeting,
-      });
-    }
-    saveJudgeCache(cache);
-  }
-  if (needAsk.length) {
-    log(`让大模型判断剩下 ${needAsk.length} 条…`);
-    const asked = await judgeJobs(llm, profile.summary, needAsk, {
-      batchSize: cfg.batchSize,
-      onBatch: (done, total) => log(`  已判断 ${done}/${total}`),
-    });
-    judgements.push(...asked);
-    for (const j of asked) {
-      const w = needAsk.find((x) => x.jobId === j.jobId);
-      cache[j.jobId] = {
-        at: Date.now(), jobName: w?.name ?? '', company: w?.company ?? '',
-        worth: j.worth, score: j.score, reason: j.reason, greeting: j.greeting,
-        profileSig: sig,
-        job: w ? { ...w } : undefined,
-      };
-    }
-    saveJudgeCache(cache);
-  }
-
-  // ⑥ 汇总（值得投 **且** 有开场白的才进名单 —— 没文案可发等于没投）
-  const worth = judgements
-    .filter((j) => j.worth && j.greeting)
-    .sort((a, b) => b.score - a.score)
-    .map((j) => ({ j, job: withJd.find((w) => w.jobId === j.jobId) as unknown as Job }));
-
-  // 不按公司限量 —— 同一家公司的几个 HR 同时收到招呼，他们互不知情（用户 2026-11-15 的判断）
-
-  log(`\n════ 大模型判断结果：${worth.length}/${judgements.length} 个值得投 ════`);
-  for (const { j, job } of worth) {
-    log(`\n【${job.name}】${job.salary} · ${job.company} · ${job.city}${job.district ? '·' + job.district : ''}`);
-    log(`  HR ${job.bossName || '?'} · ${job.bossTitle || ''} · ${job.experience} · ${job.degree} · ${job.jobId}`);
-    log(`  匹配 ${j.score} 分 —— ${j.reason}`);
-    log(`  开场白：${j.greeting}`);
-  }
-  if (!worth.length) log('\n（没有值得投的）');
-
-  // 不值得投的，简要列一下，方便调配置
-  const notWorth = judgements.filter((j) => !j.worth);
-  if (notWorth.length) {
-    log(`\n──── 不投的 ${notWorth.length} 个 ────`);
-    for (const j of notWorth.slice(0, 20)) {
-      const job = withJd.find((w) => w.jobId === j.jobId);
-      log(`  ✗ ${job?.name ?? j.jobId} · ${job?.company ?? ''} —— ${j.reason || j.error || ''}`);
-    }
-    if (notWorth.length > 20) log(`  …… 还有 ${notWorth.length - 20} 个`);
-  }
-
-  if (opts.dryRun) {
-    log('\n<dry-run> 一个字都没发。去掉 --dry-run 就会真的打招呼。');
-    return;
-  }
-
-  // ⑦ 实发
   const limit = opts.limit > 0 ? opts.limit : cfg.perRound;
-  const todayCount = sentToday(state);
-  if (cfg.dailyLimit > 0 && todayCount >= cfg.dailyLimit) {
-    log(`\n今天已经打了 ${todayCount} 个招呼（上限 ${cfg.dailyLimit}），本轮不做任何事。`);
+
+  if (cfg.dailyLimit > 0 && sentToday(state) >= cfg.dailyLimit) {
+    log(`
+今天已经打了 ${sentToday(state)} 个招呼（上限 ${cfg.dailyLimit}），本轮不做任何事。`);
     return;
   }
-
-  let targets = opts.pick
-    ? worth.filter((w) => w.job.jobId === opts.pick)
-    : worth.slice(0, limit > 0 ? limit : worth.length);
-
-  // 指定的岗位这一轮不在候选里（岗位列表会轮换）→ 从缓存里捞
-  if (opts.pick && !targets.length) {
-    const cached = cache[opts.pick];
-    if (cached?.job?.jobId) {
-      log(`\n（指定的岗位这一轮不在列表里，用缓存里的岗位信息）`);
-      targets.push({
-        j: {
-          jobId: cached.job.jobId, worth: cached.worth, score: cached.score,
-          reason: cached.reason, greeting: cached.greeting,
-        },
-        job: cached.job as unknown as Job,
-      });
-    }
-  }
-  if (opts.pick && !targets.length) {
-    log(`\n指定的岗位 ${opts.pick} 不在「值得投」的名单里 —— 换个人吧`);
-    return;
-  }
-  log(`\n════ 开始打招呼（${targets.length} 个）════`);
 
   // 服务端确认用的登录态 + 会话列表（发完一条就查一次）
-  const client = await createBrowserClient().catch((e) => {
+  const client = opts.dryRun ? null : await createBrowserClient().catch((e) => {
     log('⚠️ 拿不到登录态，服务端确认用不了：' + (e as Error).message);
     return null;
   });
   let sessions = client ? await listSessions(client, { labelId: 0, enrich: 'none' }).catch(() => []) : [];
 
-  for (let i = 0; i < targets.length; i++) {
-    const { j, job } = targets[i]!;
-    if (cfg.dailyLimit > 0 && sentToday(state) >= cfg.dailyLimit) {
-      log(`  达到今日上限 ${cfg.dailyLimit}，收工`);
+  let judged = 0;
+  let worthCount = 0;
+  let sentCount = 0;
+  let skipped = 0;
+  /**
+   * 这一轮用的标签页（**整轮只开一个**，每个岗位导航过去用）。
+   *
+   * 之前每个岗位都新开一个详情页再关掉 → 用户看到一堆页面闪来闪去。
+   * 现在：开一次，之后每个岗位把**它导航**到新地址。
+   */
+  let roundTabId: number | null = null;
+  /** 轮次开始前的标签页快照（收尾时把「这轮新开的」全关掉） */
+  const tabsBeforeRound = await tabIdsSnapshot();
+  // 给退出钩子用的：中途被杀也能把这轮开的页收掉
+  roundTabsBefore = tabsBeforeRound;
+
+  /** 开（或导航到）这个岗位的详情页 —— 整轮只开一个标签页 */
+  const openFor = async (job: Job): Promise<JobPage | null> => {
+    try {
+      const p = await openJobPage(job, roundTabId);
+      roundTabId = p.tabId;
+      return p;
+    } catch (e) {
+      log(`  ⚠️ ${job.name} 的详情页打不开：${(e as Error).message}`);
+      return null;
+    }
+  };
+  /** 上一次**打招呼**的时刻 —— 用来算两次招呼之间隔多久 */
+  let lastGreetAt = 0;
+  /** 当前这个岗位已经打开的详情页（值得投就在它上面打招呼） */
+  let currentPage: JobPage | null = null;
+
+  // --pick 指定的岗位，这一轮可能不在推荐列表里（列表会轮换）
+  // → 从判断缓存里把它捞出来（结论和文案都在那儿，岗位元数据也在）
+  let todo: Job[] = kept;
+  if (opts.pick) {
+    const inList = kept.find((j) => j.jobId === opts.pick);
+    const cachedJob = cache[opts.pick]?.job as Job | undefined;
+    if (!inList && cachedJob?.jobId) {
+      log(`（指定的岗位这一轮不在推荐列表里 —— 用判断缓存里的岗位信息补投）`);
+      todo = [cachedJob];
+    } else if (inList) {
+      todo = [inList];
+    }
+  }
+
+  for (const job of todo) {
+    if (sentCount >= limit && limit > 0) {
+      log(`
+达到本轮上限 ${limit} 个，收工。`);
       break;
     }
-    log(`\n→ ${job.name} · ${job.company} · ${job.bossName || '?'}`);
-    log(`  jobId: ${job.jobId}`);
-    log(`  ${j.greeting}`);
-    const r = await greetOne(job, j.greeting, async (jb, g) => {
-      if (!client) return true; // 没有服务端确认能力就只信页面
-      // 一直查到截止时刻为止 —— 不写死试几次、也不写死间隔。
-      // 消息是异步落库的，慢网下好几秒才到；两次查询之间等「上一次查询
-      // 自己花了多久」，网络慢就自然等得久。
+
+    // ── 判断：先看缓存，没有再问模型 ──
+    let j: Judgement | null = null;
+    const cached = cache[job.jobId];
+    const cacheOk =
+      cached &&
+      Date.now() - (cached.at ?? 0) < JUDGE_TTL_MS &&
+      cached.jobName === job.name &&
+      cached.profileSig === sig;
+    if (cacheOk) {
+      j = {
+        jobId: job.jobId, worth: cached!.worth, score: cached!.score,
+        reason: cached!.reason, greeting: cached!.greeting,
+      };
+      skipped++;
+    } else {
+      // ── 打开岗位详情页，JD 从**页面里**读（0 次接口请求）──
+      currentPage = await openFor(job);
+      if (!currentPage) continue;
+      let jd = currentPage.jd;
+      if (!jd) {
+        // 页面没渲染出 JD → 退回走接口取一次
+        log(`  ⚠️ ${job.name} 页面里没读到 JD，退回接口取`);
+        try {
+          jd = (await fetchJobDetail(job)).jd;
+        } catch (e) {
+          await closeTabs([currentPage.tabId]).catch(() => {});
+          currentPage = null;
+          if (e instanceof RateLimitedError) {
+            log('  ⚠️ 取 JD 时被风控 —— 这一轮到此为止（已打的招呼已经发出去了）');
+            break;
+          }
+          log(`  ⚠️ ${job.name} 的 JD 取不到：${(e as Error).message}`);
+          continue;
+        }
+      }
+
+      // 问模型（一次一个）
+      const [r] = await judgeJobs(llm, profile.summary, [{ ...job, jd }], { batchSize: 1 });
+      if (!r) {
+        currentPage = null; // 页面留着给下一个岗位用
+        continue;
+      }
+      j = r;
+      judged++;
+      // 记判断结果（含岗位元数据 → 以后 --pick 能补投）
+      cache[job.jobId] = {
+        at: Date.now(), jobName: job.name, company: job.company,
+        worth: r.worth, score: r.score, reason: r.reason, greeting: r.greeting,
+        profileSig: sig,
+        job: { ...job },
+      };
+      saveJudgeCache(cache);
+      // 页面先留着 —— 值得投的话直接在这个页面上打招呼
+    }
+
+    log(`
+${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
+    log(`  ${j!.score} 分 —— ${j!.reason}`);
+    if (!j!.worth || !j!.greeting) {
+      log('  ✗ 不值得投，下一个');
+      currentPage = null; // 页面留着给下一个岗位用（整轮只开一个）
+      continue;
+    }
+    worthCount++;
+    log(`  开场白：${j!.greeting}`);
+
+    // ── 打招呼 ──
+    // 两次**招呼**之间隔 4~7 分钟（随机）。
+    // 注意是按「距上次招呼」补足，不是「每处理完一个岗位就等一次」——
+    // 中间夹着不值得投的岗位时，那些等待本来就已经把间隔拉长了，
+    // 再等一次就变成两倍。
+    if (lastGreetAt && cfg.intervalMaxSec > 0) {
+      const target = Math.floor(
+        cfg.intervalMinSec + Math.random() * Math.max(0, cfg.intervalMaxSec - cfg.intervalMinSec),
+      );
+      const elapsed = Math.round((Date.now() - lastGreetAt) / 1000);
+      if (elapsed < target) {
+        const wait = target - elapsed;
+        if (opts.dryRun) {
+          // 干跑不真等，但把节奏打印出来（能看出间隔对不对）
+          log(`  [干跑] 距上次招呼 ${elapsed} 秒，真实发送时会再等 ${wait} 秒`);
+        } else {
+          log(`  …距上次招呼 ${elapsed} 秒，再等 ${wait} 秒`);
+          await sleep(wait * 1000);
+        }
+      }
+    }
+
+    if (opts.dryRun) {
+      sentCount++;
+      currentPage = null; // 页面留着给下一个岗位用
+      lastGreetAt = Date.now(); // 干跑也推进时间，模拟连续打招呼
+      continue;
+    }
+
+    // 判断结果命中缓存的岗位：刚才没开页面（不需要读 JD）→ 现在才开
+    if (!currentPage) {
+      currentPage = await openFor(job);
+      if (!currentPage) continue;
+    }
+    const pageForGreeting = currentPage;
+    const r = await greetInPage(pageForGreeting, j!.greeting, async (jb, g) => {
+      if (!client) return true;
+      // 一直查到截止时刻为止 —— 不写死试几次、也不写死间隔
       const until = Date.now() + 15_000;
       for (;;) {
         const t0 = Date.now();
@@ -380,42 +421,76 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
         if (Date.now() >= until) break;
         await sleep(Math.max(200, Date.now() - t0));
       }
-      // 会话列表可能还没刷新（新建的会话），重取一次再查
       sessions = await listSessions(client, { labelId: 0, enrich: 'none' }).catch(() => sessions);
       return verifyGreeting(client, jb, g, sessions);
     });
+
     if (r.ok) {
       recordGreeting(state, {
-        jobId: job.jobId, name: job.bossName, company: job.company,
-        status: 'sent', score: j.score, reason: j.reason,
+        jobId: job.jobId, bossId: job.bossId, name: job.bossName, company: job.company,
+        status: 'sent', score: j!.score, reason: j!.reason,
       });
       saveGreetState(state);
+      sentCount++;
       log(`  ✅ 已发出${r.convName ? '（' + r.convName + '）' : ''}`);
     } else {
       recordGreeting(state, {
-        jobId: job.jobId, name: job.bossName, company: job.company,
-        status: 'failed', score: j.score, reason: r.step,
+        jobId: job.jobId, bossId: job.bossId, name: job.bossName, company: job.company,
+        status: 'failed', score: j!.score, reason: r.step,
       });
       saveGreetState(state);
       log(`  ❌ 失败：${r.step} ${r.detail ?? ''}`);
     }
 
-    // 下一个之前歇一会儿（礼貌节奏，区间内随机）—— 最后一个不用等
-    const isLast = i === targets.length - 1;
-    if (!isLast && cfg.intervalMaxSec > 0) {
-      const wait = Math.floor(cfg.intervalMinSec + Math.random() * Math.max(0, cfg.intervalMaxSec - cfg.intervalMinSec));
-      log(`  …等 ${wait} 秒再下一个`);
-      await sleep(wait * 1000);
-    }
+    currentPage = null; // 页面留着给下一个岗位用（整轮只开一个）
+    lastGreetAt = Date.now();
   }
 
-  log(`\n本轮结束：今天累计打了 ${sentToday(state)} 个招呼`);
+  // 轮次收尾：把这轮新开的标签页全关掉（整轮只开一个，但页面自己可能多开）
+  await closeTabsOpenedSince(tabsBeforeRound).catch(() => {});
+
+  log(
+    `
+本轮结束：候选 ${kept.length} 个，实际处理 ${judged + skipped} 个` +
+    `（问模型 ${judged}、命中缓存 ${skipped}），值得投 ${worthCount} 个，` +
+    (opts.dryRun ? `打招呼 ${sentCount} 个（干跑，没发）` : `打招呼 ${sentCount} 个`),
+  );
+  if (opts.dryRun) {
+    log('<dry-run> 一个字都没发。去掉 --dry-run 就会真的打招呼。');
+  }
+  return;
 }
 
 /* ---------------- 主流程 ---------------- */
 
+/** 当前这轮开页前的标签页快照 —— 退出钩子用它收掉中途开的页（runRound 里赋值） */
+let roundTabsBefore: number[] | null = null;
+
+/** 单实例锁 —— 两个 greet 并发跑会用各自的旧内存状态互相覆盖记录（实测踩过） */
+const LOCK_FILE = path.join(DATA_DIR, 'greet.lock');
+
+function acquireLock(): boolean {
+  try {
+    const pid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim());
+    if (Number.isFinite(pid) && pid > 0) {
+      try { process.kill(pid, 0); return false; } catch { /* 持有者已死 → 接管 */ }
+    }
+  } catch { /* 没有锁文件 */ }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  return true;
+}
+function releaseLock(): void {
+  try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+}
+
 async function main() {
   process.env.BOSS_ZHIPIN_QUIET_DIAG = '1';
+
+  if (!acquireLock()) {
+    console.error('❌ 已经有一个 greet 在跑（data/greet.lock）—— 同跑两个会用旧状态互相覆盖记录。');
+    process.exit(1);
+  }
 
   const dryRun = has('--dry-run');
   const once = has('--once');
@@ -453,16 +528,20 @@ async function main() {
       log('❌ 本轮出错：' + (e as Error).message);
     }
     await bridge.stop().catch(() => {});
+    releaseLock();
     return;
   }
 
   // 常驻：一轮接一轮
   const shutdown = async () => {
     log('收到退出信号，正在退出…');
-    // 收掉本进程开着的标签页（否则会攒成标签页泄漏）
-    const closed = await cleanupGreetTabs().catch(() => 0);
-    if (closed) log(`  已关闭 ${closed} 个标签页`);
+    // 收掉这一轮开的标签页（中途被杀也不留孤儿页）
+    if (roundTabsBefore) {
+      const closed = await closeTabsOpenedSince(roundTabsBefore).catch(() => 0);
+      if (closed) log(`  已关闭 ${closed} 个标签页`);
+    }
     await bridge.stop().catch(() => {});
+    releaseLock(); // 必须在 exit 之前 —— exit 之后的代码不会执行
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());

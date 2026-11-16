@@ -16,6 +16,7 @@ docs/
 # 环境
 .env
 .env.*
+!.env.example
 
 # 编辑器 / 系统
 .vscode/

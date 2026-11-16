@@ -25,10 +25,6 @@ export interface GreetConfig {
   experiences: string[];
   /** 每个来源翻几页 */
   pages: number;
-  /** 送去给模型判的岗位上限（先粗筛再取 JD，别把 450 个全拉一遍） */
-  candidates: number;
-  /** 一批问模型几个岗位 */
-  batchSize: number;
   /** 每轮最多跟几个 HR 打招呼（0 = 不限） */
   perRound: number;
   /** 每轮最少间隔多久（秒）—— 常驻模式两轮之间的休息 */
@@ -49,8 +45,6 @@ export const DEFAULT_CONFIG: GreetConfig = {
   degrees: [],
   experiences: [],
   pages: 1,
-  candidates: 30,
-  batchSize: 3,
   perRound: 20,
   dailyLimit: 0,
   roundGapSec: 300,
