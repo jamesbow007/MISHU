@@ -21,7 +21,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 import { bridge, bridgeStatus } from '../api/bridge.js';
@@ -40,12 +40,20 @@ const sha256 = (text: string) => crypto.createHash('sha256').update(text, 'utf8'
  *   而 Chrome 还会把这份坏文件**缓存住** —— 之后连「SW 停了再启动」都读不回磁盘，
  *   只能去 chrome://extensions/ 手动点「🔄 重新加载」才能救回来。
  *   （这个坑 2026-11-15 实测踩过一次：一句 await 写在了非 async 函数里。）
+ *
+ * ⚠️ **必须用「经典脚本」目标解析** —— manifest.json 里 background.js 是
+ *    普通 service worker（没有 "type": "module"），而 node --check 会照着
+ *    本仓库 package.json 的 "type": "module" 走 **ESM**：
+ *    顶层 await、import 语句在 ESM 里合法、在经典 SW 里是致命 SyntaxError ——
+ *    也就是说 node --check 恰好放过了它最该拦的那类错。
+ *    node:vm 的 Script 用的就是经典脚本目标。
  */
 function checkSyntax(): void {
+  const src = fs.readFileSync(BG, 'utf8');
   try {
-    execFileSync(process.execPath, ['--check', BG], { stdio: 'pipe' });
+    new vm.Script(src, { filename: BG });
   } catch (e: any) {
-    const out = `${e?.stderr ?? ''}${e?.stdout ?? ''}`.trim();
+    const out = String(e?.stack ?? e?.message ?? e).trim();
     console.error('❌ extension/background.js 语法有问题 —— **没有推给扩展**（推了扩展就起不来了）');
     console.error(out.split('\n').slice(0, 8).join('\n'));
     console.error('\n改好再跑一次 npm run ext:reload。');

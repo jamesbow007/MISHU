@@ -317,33 +317,55 @@ export async function closeTabs(tabIds: number[]): Promise<number> {
 }
 
 /**
- * 当前的标签页 id 列表（快照）。
+ * 当前的标签页快照（id → 地址）。
  *
  * 用来「关掉这次打开的标签页」：开页面前拍个快照，做完再拍一次，
- * **差集**就是这次新出现的 —— 全关掉。
+ * **差集**就是这次新出现的 —— 关掉。
  *
  * 为什么不用「用完直接关自己那个」：
  *   实测简历页那次调用会**多开一个**同样地址的标签页（不知道是谁开的，
  *   但它确实存在），只关自己那个的话，每读一次简历就漏一个页面，
  *   跑久了又是一堆标签页（以前踩过 8 小时攒几百个的坑）。
+ *
+ * ⚠️ **拿不到就返回 null** —— 「没拿到快照」和「一个标签页都没有」是两回事。
+ *    以前失败时返回空数组，被当成「基线是空的」，
+ *    关标签页时差集就等于**浏览器里所有标签页** —— 用户的邮箱、编辑器全没了。
  */
-export async function tabIdsSnapshot(): Promise<number[]> {
+export type TabSnapshot = Map<number, string>;
+
+export async function tabIdsSnapshot(): Promise<TabSnapshot | null> {
   try {
     const info = await listChatTabs();
-    return (info?.tabs ?? []).map((t) => t.id);
+    const m: TabSnapshot = new Map();
+    for (const t of info?.tabs ?? []) m.set(t.id, String(t.url ?? ''));
+    return m;
   } catch {
-    return [];
+    return null;
   }
+}
+
+/** BOSS直聘 的地址（和扩展端 listTabsData 里的 isZhipin 同一套判据） */
+function isZhipinUrl(url: string): boolean {
+  return /^https:\/\/([^\/]+\.)?zhipin\.com\//.test(url);
 }
 
 /**
  * 关掉「相对于 before 新出现」的标签页。
  *
- * 用户自己开着的标签页不在差集里，不受影响。
+ * ⚠️ **两条护栏**（关错页的代价远大于漏关）：
+ *   ① **没有基线就一个都不关** —— 基线是空的时差集 = 浏览器里**所有**标签页，
+ *      一把关掉用户的邮箱、编辑器、守护进程钉住的锚点页。
+ *      宁可漏关几个页（下一轮还能收），也不能误关。
+ *   ② **只关 BOSS直聘 的页** —— 用户在轮次期间自己开的标签页
+ *      （邮件、文档、任何东西）不是我们开的，不该由我们关。
  */
-export async function closeTabsOpenedSince(before: number[]): Promise<number> {
+export async function closeTabsOpenedSince(before: TabSnapshot | null): Promise<number> {
+  if (!before || before.size === 0) return 0;
   const after = await tabIdsSnapshot();
-  const extra = after.filter((id) => !before.includes(id));
+  if (!after) return 0;
+  const extra = [...after.entries()]
+    .filter(([id, url]) => !before.has(id) && isZhipinUrl(url))
+    .map(([id]) => id);
   if (!extra.length) return 0;
   return closeTabs(extra);
 }

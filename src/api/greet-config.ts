@@ -17,14 +17,23 @@ import type { LlmConfig } from './llm.js';
 export const CONFIG_FILE = path.join(DATA_DIR, 'greet-config.json');
 
 export interface GreetConfig {
-  /** 薪资下限（K）。0 = 不限 */
-  salaryMinK: number;
-  /** 学历白名单（空 = 不限） */
-  degrees: string[];
-  /** 经验白名单（空 = 不限），按 JD 里的「3-5年」这种原文匹配 */
-  experiences: string[];
-  /** 每个来源翻几页 */
+  /**
+   * 每个来源翻几页。
+   *
+   * ⚠️ **这里不提供「薪资下限 / 学历 / 年限」这类筛选** —— 用户 2026-11-15 明确判断过：
+   *    列表接口白送的这些字段**不一定是真的门槛**（很多岗位照模板写的），
+   *    真匹不匹配要看 JD 内容，那是模型的活。
+   *    所以配置里就不放这些开关，免得看着能调其实没接线。
+   */
   pages: number;
+  /**
+   * 一轮里最多**处理**几个岗位（开详情页 + 问模型）。
+   *
+   * 为什么要有这个上限：处理一个岗位 = 一次详情页加载（3~8 秒）+ 一次模型调用。
+   * 没有上限的话，一轮可能把推荐区几十个岗位全跑一遍（又慢又烧钱），
+   * 而且「本轮上限」只数**发成功**的 —— 一路失败的话根本停不下来。
+   */
+  candidates: number;
   /** 每轮最多跟几个 HR 打招呼（0 = 不限） */
   perRound: number;
   /** 每轮最少间隔多久（秒）—— 常驻模式两轮之间的休息 */
@@ -41,10 +50,8 @@ export interface GreetConfig {
 }
 
 export const DEFAULT_CONFIG: GreetConfig = {
-  salaryMinK: 0,
-  degrees: [],
-  experiences: [],
   pages: 1,
+  candidates: 30,
   perRound: 20,
   dailyLimit: 0,
   roundGapSec: 300,

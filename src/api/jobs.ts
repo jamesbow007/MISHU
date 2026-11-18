@@ -266,7 +266,11 @@ export async function listRecommendJobs(
 export async function fetchJobDetail(job: Job): Promise<JobDetail> {
   const cache = loadJdCache();
   const hit = cache[job.jobId];
-  if (hit && Date.now() - (hit.at ?? 0) < JD_CACHE_TTL_MS) {
+  // ⚠️ **空 JD 的旧条目当没命中** —— 那是早期版本写进去的，
+  //    照着用会让这个岗位的回退路径一直拿到空串。
+  //    （先删掉，本次拿到详情后统一写一次缓存。）
+  if (hit && !hit.jd) delete cache[job.jobId];
+  if (hit && hit.jd && Date.now() - (hit.at ?? 0) < JD_CACHE_TTL_MS) {
     return {
       jd: hit.jd,
       address: hit.address,
@@ -302,8 +306,19 @@ export async function fetchJobDetail(job: Job): Promise<JobDetail> {
     industry: String(ci.industryName ?? job.industry),
   };
 
-  cache[job.jobId] = { at: Date.now(), ...detail };
-  saveJdCache(cache);
+  // ⚠️ **空 JD 不进缓存** —— 缓存是 7 天的，
+  //    一次空响应（或岗位 JD 本来就是空）会把「退回接口取 JD」这条路毒 7 天：
+  //    之后每次回退都拿到空串 → 拿着空 JD 去问模型 → 被判「不值得投」。
+  if (detail.jd) {
+    cache[job.jobId] = { at: Date.now(), ...detail };
+    saveJdCache(cache);
+  } else {
+    // 之前存进去的空记录顺手删掉 —— 别让它继续占着 7 天的坑
+    if (cache[job.jobId]) {
+      delete cache[job.jobId];
+      saveJdCache(cache);
+    }
+  }
   return detail;
 }
 

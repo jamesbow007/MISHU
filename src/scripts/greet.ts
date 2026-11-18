@@ -24,7 +24,7 @@ import {
   verifyGreeting,
   type JobPage,
 } from '../api/greet.js';
-import { closeTabs, closeTabsOpenedSince, tabIdsSnapshot } from '../api/page-transport.js';
+import { closeTabs, closeTabsOpenedSince, tabIdsSnapshot, type TabSnapshot } from '../api/page-transport.js';
 import { listSessions } from '../api/messages.js';
 import {
   backfillBosses,
@@ -53,6 +53,18 @@ import { sleep } from '../api/util.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR = path.join(ROOT, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'greet.log');
+
+/**
+ * 一次「服务端确认」最多刷几次会话列表。
+ *
+ * 为什么要有上限：会话列表接口（`geekFilterByLabel`）一次返回**全部**会话
+ * （几百条），是会被风控盯上的请求 —— 实测连打 4~5 个就 code=37，
+ * 撞上之后 bridge 会在请求内部睡 90 秒再重试，整个确认过程会卡住一两分钟。
+ *
+ * 2 次够用：新会话一般 1~3 秒就建好，第一次刷新多半已经能看到；
+ * 再多刷也是白刷（服务端还没落库）。
+ */
+const MAX_SESSION_REFRESH = 2;
 
 /* ---------------- 小工具 ---------------- */
 
@@ -218,12 +230,16 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
   const all = await collectJobs(cfg);
   log(`  合计 ${all.length} 条（去重后）`);
 
-  // ③ 粗筛（只挡已经联系过的；其余交给大模型按简历和 JD 判）
+  // ③ 老记录的 bossId 回填（幂等迁移）—— 逻辑收在 greet-state.ts
+  //    ⚠️ **必须在粗筛之前** —— 按人去重的判断先查 bosses 表，
+  //    回填晚了这一轮的迁移就白做了：老记录里的 HR 还会被再打扰一次
+  //    （升级后的第一轮正是最该去重的时候）。
+  backfillBosses(state, all);
+
+  // ④ 粗筛（只挡已经联系过的；其余交给大模型按简历和 JD 判）
   //    判断和记账用同一份 state，别加载两份
   const { kept, dropped } = filterJobs(all, cfg, state);
 
-  // 老记录的 bossId 回填（幂等迁移）—— 逻辑收在 greet-state.ts
-  backfillBosses(state, all);
   saveGreetState(state);
   const dropTxt = Object.entries(dropped).filter(([, n]) => n > 0).map(([k, n]) => `${k}${n}`).join(' ');
   log(`  粗筛后 ${kept.length} 条${dropTxt ? `（去掉：${dropTxt}）` : ''}`);
@@ -249,6 +265,9 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
 今天已经打了 ${sentToday(state)} 个招呼（上限 ${cfg.dailyLimit}），本轮不做任何事。`);
     return;
   }
+  /** 今天还能打几个（循环里每发一个就少一个 —— 见下面循环内的检查） */
+  const dailyLeft = () =>
+    cfg.dailyLimit > 0 ? Math.max(0, cfg.dailyLimit - sentToday(state)) : Infinity;
 
   // 服务端确认用的登录态 + 会话列表（发完一条就查一次）
   const client = opts.dryRun ? null : await createBrowserClient().catch((e) => {
@@ -267,11 +286,12 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
    * 之前每个岗位都新开一个详情页再关掉 → 用户看到一堆页面闪来闪去。
    * 现在：开一次，之后每个岗位把**它导航**到新地址。
    */
-  let roundTabId: number | null = null;
-  /** 轮次开始前的标签页快照（收尾时把「这轮新开的」全关掉） */
-  const tabsBeforeRound = await tabIdsSnapshot();
+  // ⚠️ roundTabId 是**模块级**的（给退出钩子用）—— 退出钩子要知道
+  //    这一轮用的那个页的 id，才能在快照失效时也把它关掉。
+  roundTabId = null;
+  // 轮次开始前的标签页快照（收尾时把「这轮新开的」全关掉）
   // 给退出钩子用的：中途被杀也能把这轮开的页收掉
-  roundTabsBefore = tabsBeforeRound;
+  roundTabsBefore = await tabIdsSnapshot();
 
   /** 开（或导航到）这个岗位的详情页 —— 整轮只开一个标签页 */
   const openFor = async (job: Job): Promise<JobPage | null> => {
@@ -280,6 +300,10 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
       roundTabId = p.tabId;
       return p;
     } catch (e) {
+      // 标签页可能已经开出来了（只是读取失败）—— 记下来，
+      // 否则它成了没人管的孤儿页（轮末也收不掉）
+      const tid = (e as any)?.tabId;
+      if (typeof tid === 'number' && tid > 0) roundTabId = tid;
       log(`  ⚠️ ${job.name} 的详情页打不开：${(e as Error).message}`);
       return null;
     }
@@ -288,6 +312,16 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
   let lastGreetAt = 0;
   /** 当前这个岗位已经打开的详情页（值得投就在它上面打招呼） */
   let currentPage: JobPage | null = null;
+  /**
+   * **本轮**已经联系过的 HR（bossId）。
+   *
+   * 为什么单独记一份、不直接用 greetedRecently：
+   *   greetedRecently 查的是**历史冷却**（30 天内不再打扰），
+   *   而 `--pick` 的语义恰恰是「这个刚失败过，我就是要补投」——
+   *   拿历史冷却去挡它，补投功能就没了。
+   *   这一份只管「**这一轮**别把同一个人打两遍」。
+   */
+  const greetedBossesThisRound = new Set<string>();
 
   // --pick 指定的岗位，这一轮可能不在推荐列表里（列表会轮换）
   // → 从判断缓存里把它捞出来（结论和文案都在那儿，岗位元数据也在）
@@ -295,19 +329,50 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
   if (opts.pick) {
     const inList = kept.find((j) => j.jobId === opts.pick);
     const cachedJob = cache[opts.pick]?.job as Job | undefined;
-    if (!inList && cachedJob?.jobId) {
-      log(`（指定的岗位这一轮不在推荐列表里 —— 用判断缓存里的岗位信息补投）`);
-      todo = [cachedJob];
-    } else if (inList) {
+    if (inList) {
       todo = [inList];
+    } else if (cachedJob?.jobId) {
+      // ⚠️ 判断缓存里存的岗位元数据可能是 v0.3.0 之前写的（没有 bossId）。
+      //    没有 bossId 就没法「按人」去重 —— 同一个 HR 的另一个岗位会被再打扰一次。
+      //    从已联系记录里把 bossId 补回来。
+      const bossId = cachedJob.bossId || state.greeted[opts.pick]?.bossId;
+      todo = [bossId && bossId !== cachedJob.bossId ? { ...cachedJob, bossId } : cachedJob];
+      log(`（指定的岗位这一轮不在推荐列表里 —— 用判断缓存里的岗位信息补投）`);
+    } else {
+      // ⚠️ **找不到就一个都不做** —— 以前这里没有 else，`todo` 保持成整份名单，
+      //    结果「补投一个岗位」变成了给名单上所有人挨个打招呼（最多 20 个真招呼）。
+      log(`⚠️ 指定的岗位 ${opts.pick} 不在「值得投」的名单里，也不在判断缓存里 —— 什么也不做。`);
+      return;
     }
+  } else if (cfg.candidates > 0 && kept.length > cfg.candidates) {
+    // 候选上限：处理一个岗位 = 一次详情页加载 + 一次模型调用。
+    // 没有上限的话，一轮可能把推荐区几十个岗位全跑一遍。
+    log(`  候选上限 ${cfg.candidates} 条 —— 只处理前 ${cfg.candidates} 条`);
+    todo = kept.slice(0, cfg.candidates);
   }
 
   for (const job of todo) {
+    // ⚠️ **每日上限要在这轮里反复查** —— 只在轮次开头查一次的话，
+    //    「今天还剩 1 个名额」也会照发一整轮（上限形同虚设）。
+    if (dailyLeft() <= 0) {
+      log(`
+今天已经打了 ${sentToday(state)} 个招呼（上限 ${cfg.dailyLimit}），收工。`);
+      break;
+    }
     if (sentCount >= limit && limit > 0) {
       log(`
 达到本轮上限 ${limit} 个，收工。`);
       break;
+    }
+
+    // ⚠️ **同一轮里别把同一个人打两遍** —— 同一个 HR 常常同时挂好几个岗位，
+    //    粗筛只用轮次开始时的状态算过一遍，不复查就会在同一轮里打扰他两次。
+    //    ⚠️ 这里查的是**本轮**打过谁，不是历史冷却 ——
+    //    历史冷却由粗筛负责；`--pick` 补投正是要绕过历史冷却的。
+    const bossId = job.bossId || state.greeted[job.jobId]?.bossId;
+    if (bossId && greetedBossesThisRound.has(bossId)) {
+      log(`  ${job.name} · ${job.company} —— 这位 HR 本轮已经联系过了，跳过`);
+      continue;
     }
 
     // ── 判断：先看缓存，没有再问模型 ──
@@ -329,7 +394,12 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
       currentPage = await openFor(job);
       if (!currentPage) continue;
       let jd = currentPage.jd;
-      if (!jd) {
+      // 页面没渲染出 JD（空）→ 退回走接口取一次。
+      // ⚠️ **只认「空」，不认「短」** —— 有的岗位 JD 本来就一句话
+      //    （「负责 XX 开发」），那是真 JD，值得让模型看一眼；
+      //    但页面还没渲染完时读到的是半截（甚至标题）——
+      //    这种「读了一半」的情况靠长度兜一下，拿到接口的版本更准。
+      if (!jd || jd.length < 30) {
         // 页面没渲染出 JD → 退回走接口取一次
         log(`  ⚠️ ${job.name} 页面里没读到 JD，退回接口取`);
         try {
@@ -345,6 +415,15 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
           continue;
         }
       }
+      // ⚠️ **还是空就不问了** —— 拿空 JD 去问模型，它会答「职位描述为空，
+      //    无法判断，不值得投」，然后这个结论被缓存 24 小时 ——
+      //    岗位就因为「没读到 JD」白等一天（真发生过，见 data/greet-judgements.json）。
+      //    注意：**短的照样问** —— 一句话的 JD 也是 JD。
+      if (!jd) {
+        log(`  ⚠️ ${job.name} 没读到 JD —— 跳过（不拿空 JD 去问模型）`);
+        currentPage = null;
+        continue;
+      }
 
       // 问模型（一次一个）
       const [r] = await judgeJobs(llm, profile.summary, [{ ...job, jd }], { batchSize: 1 });
@@ -354,6 +433,13 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
       }
       j = r;
       judged++;
+      // ⚠️ **模型没给出结论就不进缓存** —— 超时/限流/漏返回都会被记成
+      //    「不值得投」，缓存 24 小时后这个岗位就再也不会被考虑了。
+      if (r.error) {
+        log(`  ⚠️ 模型没给出结论（${r.reason}）—— 不缓存，下轮再问`);
+        currentPage = null;
+        continue;
+      }
       // 记判断结果（含岗位元数据 → 以后 --pick 能补投）
       cache[job.jobId] = {
         at: Date.now(), jobName: job.name, company: job.company,
@@ -361,6 +447,9 @@ async function runRound(cfg: GreetConfig, llm: LlmConfig, opts: RoundOpts) {
         profileSig: sig,
         job: { ...job },
       };
+      // ⚠️ **判完就落盘** —— 攒到轮末写的话，中途 Ctrl+C 就把这一轮
+      //    问过的模型全丢了（两个招呼之间要等 4~7 分钟，一轮两小时）。
+      //    全量写一次也就几十 KB，落盘代价可以忽略。
       saveJudgeCache(cache);
       // 页面先留着 —— 值得投的话直接在这个页面上打招呼
     }
@@ -414,15 +503,33 @@ ${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
     const r = await greetInPage(pageForGreeting, j!.greeting, async (jb, g) => {
       if (!client) return true;
       // 一直查到截止时刻为止 —— 不写死试几次、也不写死间隔
+      //
+      // 两类请求要分开对待：
+      //   · **会话列表**（重）：一次返回全部会话（几百条），会被风控盯上
+      //     （实测连打 4~5 个就 code=37，撞上之后 bridge 会在请求内部
+      //      睡 90 秒再重试 → 整个确认卡住一两分钟，后面所有 API 全废）。
+      //     → 最多刷 2 次，间隔拉开。
+      //   · **消息历史**（轻）：确认「这句话在不在」靠它。
+      //     → 每 2 秒查一次，一直到 15 秒。
+      //
+      // 为什么列表最多 2 次：点完发送到服务端建好会话要 1~3 秒，
+      // 第一次刷新太早会打空，第二次（几秒后）才拿得到新会话。
+      // 再多刷也是白刷 —— 服务端没落库的时候刷多少次都一样。
       const until = Date.now() + 15_000;
+      let refreshed = 0;
       for (;;) {
-        const t0 = Date.now();
-        if (await verifyGreeting(client, jb, g, sessions)) return true;
+        if (refreshed < MAX_SESSION_REFRESH) {
+          sessions = await listSessions(client, { labelId: 0, enrich: 'none' }).catch(() => sessions);
+          refreshed++;
+          if (await verifyGreeting(client, jb, g, sessions)) return true;
+        } else {
+          // 列表不再刷了（重接口）—— 只用手上这份查消息历史（轻接口）
+          if (await verifyGreeting(client, jb, g, sessions)) return true;
+        }
         if (Date.now() >= until) break;
-        await sleep(Math.max(200, Date.now() - t0));
+        await sleep(2000);
       }
-      sessions = await listSessions(client, { labelId: 0, enrich: 'none' }).catch(() => sessions);
-      return verifyGreeting(client, jb, g, sessions);
+      return false;
     });
 
     if (r.ok) {
@@ -431,6 +538,7 @@ ${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
         status: 'sent', score: j!.score, reason: j!.reason,
       });
       saveGreetState(state);
+      if (bossId) greetedBossesThisRound.add(bossId);
       sentCount++;
       log(`  ✅ 已发出${r.convName ? '（' + r.convName + '）' : ''}`);
     } else {
@@ -439,6 +547,8 @@ ${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
         status: 'failed', score: j!.score, reason: r.step,
       });
       saveGreetState(state);
+      // 失败也算「这轮联系过」—— 同一个人这轮就别再打了
+      if (bossId) greetedBossesThisRound.add(bossId);
       log(`  ❌ 失败：${r.step} ${r.detail ?? ''}`);
     }
 
@@ -446,8 +556,13 @@ ${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
     lastGreetAt = Date.now();
   }
 
-  // 轮次收尾：把这轮新开的标签页全关掉（整轮只开一个，但页面自己可能多开）
-  await closeTabsOpenedSince(tabsBeforeRound).catch(() => {});
+  // 轮次收尾
+  // · 判断缓存每个判断后就落盘了（防中途 Ctrl+C 丢掉整轮模型开销），这里再存一次收个尾
+  // · 状态（已联系名单）每记一次就得落盘 —— 那个不能攒，攒了中途被 kill 就等于没记
+  saveJudgeCache(cache);
+  saveGreetState(state);
+  // 把这轮开的标签页关掉（我们用的那个 + 页面自己多开的那些）
+  await cleanupRoundTabs();
 
   log(
     `
@@ -464,7 +579,42 @@ ${job.name} · ${job.company} · ${job.bossName || '?'} · ${job.salary}`);
 /* ---------------- 主流程 ---------------- */
 
 /** 当前这轮开页前的标签页快照 —— 退出钩子用它收掉中途开的页（runRound 里赋值） */
-let roundTabsBefore: number[] | null = null;
+let roundTabsBefore: TabSnapshot | null = null;
+
+/**
+ * 当前这轮用的那个标签页（整轮只开一个，每个岗位导航过去用）。
+ *
+ * 为什么要单独记着（不能只靠差集）：
+ *   差集 = 「轮次开始之后新出现的页」，前提是**轮次开始时拍到了基线**。
+ *   2026-11-18 实测：有一轮退出时基线快照是空的（扩展刚重载完在重连），
+ *   于是差集整个失效 —— 那个页留在浏览器里，得手动关。
+ *   而这个 id 我们一直握着（每轮就开一个页、反复导航过去）——
+ *   直接关它最稳，不依赖任何快照。
+ */
+let roundTabId: number | null = null;
+
+/**
+ * 收掉这一轮开的标签页。
+ *
+ * 两条一起做，各管一段：
+ *   · **差集** —— 页面自己可能多开几个（实测读简历那次会多开一个），
+ *     那些我们不知道，只能靠差集
+ *   · **roundTabId** —— 我们自己用的那个，id 就在手里，直接关
+ */
+async function cleanupRoundTabs(): Promise<void> {
+  // ⚠️ **先关我们自己用的那个** —— 差集里通常也含它，
+  //    先关掉它，差集那一步就只会算「多出来的那些」，
+  //    同一个页不会被关两次、日志也不会报两遍。
+  if (roundTabId) {
+    const closed = await closeTabs([roundTabId]).catch(() => 0);
+    if (closed) log(`  已关闭 ${closed} 个标签页`);
+    roundTabId = null;
+  }
+  if (roundTabsBefore) {
+    const closed = await closeTabsOpenedSince(roundTabsBefore).catch(() => 0);
+    if (closed) log(`  已关闭 ${closed} 个标签页`);
+  }
+}
 
 /** 单实例锁 —— 两个 greet 并发跑会用各自的旧内存状态互相覆盖记录（实测踩过） */
 const LOCK_FILE = path.join(DATA_DIR, 'greet.lock');
@@ -536,10 +686,7 @@ async function main() {
   const shutdown = async () => {
     log('收到退出信号，正在退出…');
     // 收掉这一轮开的标签页（中途被杀也不留孤儿页）
-    if (roundTabsBefore) {
-      const closed = await closeTabsOpenedSince(roundTabsBefore).catch(() => 0);
-      if (closed) log(`  已关闭 ${closed} 个标签页`);
-    }
+    await cleanupRoundTabs();
     await bridge.stop().catch(() => {});
     releaseLock(); // 必须在 exit 之前 —— exit 之后的代码不会执行
     process.exit(0);

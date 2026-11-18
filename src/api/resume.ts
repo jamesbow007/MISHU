@@ -79,9 +79,17 @@ export async function readMyProfile(): Promise<MyProfile> {
       { mode: 'read' },
       { url: RESUME_URL, own: true, keep: true, tabId: tabId ?? undefined },
     ).catch((e: any) => {
-      // 失败时也要记住 tabId —— 否则这个标签页永远关不掉（泄漏）。
-      // 扩展的错误信封里现在会带 tabId。
-      if (e?.tabId) tabId = e.tabId;
+      const msg = String(e?.message ?? '');
+      if (/标签页不在了/.test(msg)) {
+        // ⚠️ **这个标签页已经没了** —— 记着它只会让每次重试都撞同一个死 id
+        //   （扩展报的就是死 id），重试到死也读不出来，整轮就废了。
+        //   置空 → 下一次重试新开一个（自愈）。
+        tabId = null;
+      } else if (e?.tabId) {
+        // 失败时也要记住 tabId —— 否则这个标签页永远关不掉（泄漏）。
+        // 扩展的错误信封里现在会带 tabId。
+        tabId = e.tabId;
+      }
       return null;
     });
     tabId = res?.tabId ?? tabId;

@@ -213,7 +213,7 @@ async function listTabsData() {
       url: String(t.url || '').slice(0, 120),
       active: !!t.active,
       windowId: t.windowId,
-      isZhipin: /^https:\/\/[^/]*zhipin\.com\//.test(String(t.url || '')),
+      isZhipin: /^https:\/\/([^\/]+\.)?zhipin\.com\//.test(String(t.url || '')),
     })),
   };
 }
@@ -232,7 +232,7 @@ async function closeLeakedTabsData(task) {
   const allTabs = await chrome.tabs.query({});
   const pin = await loadPin();
   const chat = allTabs.filter((t) =>
-    /^https:\/\/[^/]*zhipin\.com\/web\/geek\/chat/.test(String(t.url || '')),
+    /^https:\/\/([^\/]+\.)?zhipin\.com\/web\/geek\/chat/.test(String(t.url || '')),
   );
   // 保留：每个窗口当前正在看的那一个 + 守护进程自己固定的那个
   // （注意是按「标签页」保留，不是按窗口 —— 一个窗口里可能攒了几十个）
@@ -342,8 +342,35 @@ async function dispatch(data) {
     return tabsTask(data.taskId, async () => {
       const ids = (data.task?.tabIds ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
       if (!ids.length) return { closed: 0 };
-      await chrome.tabs.remove(ids).catch(() => {});
-      return { closed: ids.length };
+      // ⚠️ **只关还活着的页** —— chrome.tabs.remove 是**批量**操作，
+      //    混一个不存在的 id 进去会整批失败（No tab with id），
+      //    连还开着的那几个也关不掉（用户中途自己关了一个就中招）。
+      const alive = [];
+      for (const id of ids) {
+        const t = await chrome.tabs.get(id).catch(() => null);
+        if (t) alive.push(t);
+      }
+      if (!alive.length) return { closed: 0, gone: ids.length };
+      // ⚠️ **别关用户正在看的那个** —— 「关掉这轮新开的」是按差集算的，
+      //    万一用户中途自己开了个页、又切过去看了，那个页不该由我们关掉。
+      //    但**窗口里只有它一个**时不用护：那种是自己新建窗口开的页
+      //    （浏览器一个窗口都没有时的兜底路径），护了就永远关不掉。
+      const all = await chrome.tabs.query({});
+      const activeIds = new Set(all.filter((t) => t.active).map((t) => t.id));
+      const perWindow = new Map();
+      for (const t of all) perWindow.set(t.windowId, (perWindow.get(t.windowId) ?? 0) + 1);
+      const targets = alive.filter((t) => {
+        if (!activeIds.has(t.id)) return true;
+        return (perWindow.get(t.windowId) ?? 0) <= 1; // 窗口里就它一个 → 关
+      });
+      if (targets.length) await chrome.tabs.remove(targets.map((t) => t.id)).catch(() => {});
+      // closed 报**实际关掉的**数量（不是打算关的）——
+      // 否则调用方会把同一个页算两次。
+      return {
+        closed: targets.length,
+        skipped: alive.length - targets.length,
+        gone: ids.length - alive.length,
+      };
     });
   }
   // 重载标签页 —— 用来救「页面卡住、列表加载不出来」的标签页
@@ -425,7 +452,8 @@ async function runPageTask(taskId, task) {
           return;
         }
       } catch (e) {
-        send({ ok: false, error: '标签页不在了：' + task.taskId, tabId: task.tabId });
+        // ⚠️ 任务体里没有 taskId（id 在外层信封上）—— 拼 task.taskId 只会打出 undefined
+        send({ ok: false, error: '标签页不在了：' + task.tabId, tabId: task.tabId });
         return;
       }
 
@@ -434,8 +462,25 @@ async function runPageTask(taskId, task) {
       if (task.goto) {
         try {
           await chrome.tabs.update(tab.id, { url: task.goto });
-          await waitForTabLoad(tab.id, PAGE_LOAD_BUDGET_MS);
-          tab = await chrome.tabs.get(tab.id);
+          // ⚠️ **两步共用一个总预算** —— tabs.update 是「请求发出」就返回，
+          //    status 要到新文档 commit 才变。这中间旧页面还是 complete，
+          //    下面的 executeScript 会读到**上一个岗位**的 DOM。
+          //    所以先等地址真的换过去，再等新页面加载完。
+          //    （共用预算：两步各 10 秒的话最坏 20 秒会撞上桥接的硬上限。）
+          const navDeadline = Date.now() + PAGE_LOAD_BUDGET_MS;
+          const landed = await waitForTabUrl(tab.id, task.goto, Math.max(0, navDeadline - Date.now()));
+          await waitForTabLoad(tab.id, Math.max(0, navDeadline - Date.now()));
+          tab = (await chrome.tabs.get(tab.id)) ?? tab;
+          // ⚠️ **没落到目标地址要报错** —— 跳了登录页/被改地址时，
+          //    下面读到的会是空 DOM，静默下去会被误判成「这个岗位没有 JD」。
+          if (landed && !landed.ok) {
+            send({
+              ok: false,
+              error: '标签页没导航到目标地址（可能被重定向）：' + String(tab.url || '').slice(0, 120),
+              tabId: tab.id,
+            });
+            return;
+          }
         } catch (e) {
           send({ ok: false, error: '标签页导航失败：' + String((e && e.message) || e), tabId: tab.id });
           return;
@@ -444,7 +489,14 @@ async function runPageTask(taskId, task) {
     }
 
     // ① 固定标签页优先：省掉页面加载时间，也让 MQTT 连接常驻
-    if (!tab && task.type === 'dom') {
+    //
+    // ⚠️ **只有明确要固定页的任务（task.pin）才复用它。**
+    //    以前谁都能复用固定页 —— 打招呼流程传的是 own:true
+    //    （=「开自己的页，别动我的界面」），却会落到守护进程钉住的聊天标签页上：
+    //      · 读到的不是岗位页，是聊天页 → JD 读空、岗位名读空
+    //      · 还会把那个锚点导航到岗位详情页 → 守护进程卡在岗位页上出不来
+    //    守护进程自己（auto-deliver）传的就是 pin:true，所以它照旧复用固定页。
+    if (!tab && task.type === 'dom' && task.pin) {
       const pin = await loadPin();
       if (pin?.tabId) {
         try {
@@ -512,12 +564,25 @@ async function runPageTask(taskId, task) {
     // （固定页的写入在上面「新开标签页」分支里已经做过了 —— 这里不再写）
     if (task.type === 'dom') {
       try {
-        const fn = task.fn ? getPageFn(task.fn) : task.actions ? domActions : domProbe;
-        if (!fn) {
+        const picked = task.fn ? getPageFn(task.fn) : null;
+        // ⚠️ 未知页面函数要在**这里**报出去 —— 放后面的话 fn 会落到 domProbe
+        //    （非空），真正炸的是下一行的 picked.surface，报出来的错是
+        //    「Cannot read properties of null」而不是「未知页面函数：xxx」。
+        if (task.fn && !picked) {
           send({ ok: false, error: '未知页面函数：' + task.fn, tabId: tab?.id ?? null });
           return;
         }
-        const arg = task.fn ? task.arg ?? {} : task.actions ? task.actions : task.probe || 'unread';
+        const fn = picked ? picked.fn : task.actions ? domActions : domProbe;
+        if (!fn) {
+          send({ ok: false, error: '没有可执行的页面函数', tabId: tab?.id ?? null });
+          return;
+        }
+        // surface 决定页面函数用哪套选择器（弹窗 / 聊天页 / 两个都要）
+        const arg = task.fn
+          ? { ...(task.arg ?? {}), ...(picked?.surface ? { surface: picked.surface } : {}) }
+          : task.actions
+            ? task.actions
+            : task.probe || 'unread';
         const out = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: fn,
@@ -869,14 +934,17 @@ async function domProbe(probe) {
  *
  * executeScript({func}) 传的是**函数本身**，不是字符串（扩展 CSP 禁止 eval）。
  * 所以要用哪个页面函数，得在扩展侧先映射好。
+ *
+ * 返回 {fn, surface} —— surface 是传给页面函数的选择器分流参数
+ * （'greet' 弹窗 / 'chat' 聊天页 / 'both' 两个都要）。
  */
 function getPageFn(name) {
-  if (name === 'greeting') return pageGreetingTask;
-  if (name === 'jobs') return pageJobsTask;
-  if (name === 'resume') return pageResumeTask;
-  if (name === 'chat') return pageChatTask;
-  if (name === 'detail') return pageDetailTask;
-  if (name === 'greet') return pageGreetTask;
+  if (name === 'greeting') return { fn: pageGreetingTask };
+  if (name === 'resume') return { fn: pageResumeTask };
+  if (name === 'chat') return { fn: pageSurfaceTask, surface: 'chat' };
+  if (name === 'detail') return { fn: pageDetailTask };
+  if (name === 'greet') return { fn: pageSurfaceTask, surface: 'greet' };
+  if (name === 'surfaces') return { fn: pageSurfaceTask, surface: 'both' };
   return null;
 }
 
@@ -894,18 +962,42 @@ function getPageFn(name) {
  *   send    点「发送」
  *   dump    弹窗容器的原始 HTML（排查用）
  */
-function pageGreetTask(arg) {
+/**
+ * 「打招呼表面」任务 —— 弹窗（greet）和聊天页（chat）两套 UI。
+ *
+ * 为什么合成一个函数：
+ *   两个表面要用的「把文字写进输入框」那段逻辑一模一样，
+ *   复制两份的话迟早漂移（已经漂过一次：注释还写着「设 textContent」，
+ *   代码早就换成 execCommand 了）。表面差异只在**选择器**上，
+ *   用 arg.surface 分流就够。
+ *
+ * ⚠️ 页面函数会被 executeScript 序列化后注入页面 —— 注入的只有函数自己的源码，
+ *    所以 writeInto 必须定义在**这个函数里面**（引用模块级函数在页面里是
+ *    ReferenceError，而且表现为静默的 null）。
+ *    2026-11-15 实测：type 模式调了模块级的 writeInto → 一整晚 no-input。
+ *
+ * 模式（arg.mode）：
+ *   state   表面开没开？输入框在不在？发送按钮解禁没？
+ *   type    把 arg.text 写进这个表面的输入框
+ *   send    点这个表面的发送按钮（greet=「发送」，chat=「提交」）
+ *   dump    弹窗容器的原始 HTML（排查用）
+ *
+ * arg.surface：'greet' | 'chat' | 'both'
+ *   'both' 只在 state 模式下有意义 —— 一次往返拿到两个表面的状态。
+ *   （桥接是单飞的，并发两个请求也只是排队，省一次往返是实打实的快。）
+ */
+function pageSurfaceTask(arg) {
   const A = arg || {};
   const mode = A.mode || 'state';
+  const surface = A.surface === 'chat' ? 'chat' : A.surface === 'both' ? 'both' : 'greet';
+  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
+  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
+  const out = { mode, ok: false, step: mode, at: Date.now(), surface };
+
   /**
    * 把文字写进输入框，并让 Vue 知道。
    *
-   * ⚠️ **必须是函数内的局部定义**：本函数会被 executeScript 序列化后注入页面，
-   *    注入的只有函数自己的源码 —— 引用模块级函数在页面里是 ReferenceError，
-   *    而且表现为**静默的 null**（executeScript 不报错，结果直接没了）。
-   *    2026-11-15 实测：type 模式调了模块级的 writeInto → 一整晚 no-input。
-   *
-   * - contenteditable 的 div（新版聊天页的 #chat-input）：设 textContent
+   * - contenteditable 的 div（新版聊天页的 #chat-input）：用 execCommand 插入
    * - textarea：走原生 value setter（直接赋值 Vue 的 v-model 收不到）
    * 两种都要再派发 input / change 事件。
    */
@@ -951,11 +1043,9 @@ function pageGreetTask(arg) {
     el.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
+  /* ---------------- 弹窗表面（greet） ---------------- */
 
-  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
-  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
-  const out = { mode, ok: false, step: mode, at: Date.now() };
-
+  /** 弹窗的「发送」按钮 */
   const sendBtn = () =>
     Array.from(document.querySelectorAll('.send-message, [class*="send-message"]')).filter(visible)[0] ||
     null;
@@ -971,18 +1061,71 @@ function pageGreetTask(arg) {
     return null;
   };
 
-  if (mode === 'state') {
-    out.dialogOpen = /dialog-open/.test(String(document.body.className || ''));
+  /**
+   * 弹窗自己的输入框。
+   *
+   * ⚠️ **只认弹窗自己的**（textarea.input-area），不许回退到别的框。
+   *    2026-11-15 实测的 bug：原来有一串 fallback（任意可见 textarea →
+   *    任意可见 contenteditable）。弹窗刚被检测到、页面就跳到聊天页时，
+   *    文字被写进了**聊天页的输入框**，但调用方以为写的是弹窗 → 去等弹窗的
+   *    「发送」解禁 → 那个按钮从没被写过 → 永远不解禁（still-disabled），
+   *    而且那句话还留在聊天输入框里没发出去。
+   */
+  const greetInput = () =>
+    Array.from(document.querySelectorAll('textarea.input-area')).filter(visible)[0] || null;
+
+  /* ---------------- 聊天页表面（chat） ---------------- */
+
+  /**
+   * 聊天页的输入框 —— **有两个**，别搞错：
+   *   DIV#chat-input.chat-input  contenteditable  ← 真正能用的（新版聊天页）
+   *   DIV.input-box > textarea.input                ← 旧版残留，**一直隐藏**
+   * 早期对着后者写，怎么都写不进去（消息发不出去就是这个原因）。
+   */
+  const inputBox = () => document.querySelector('.input-box');
+  // ⚠️ 只认**聊天页自己的**输入框：#chat-input（新版）或 .input-box 里的旧版 textarea。
+  //    不能拿「任意可见 textarea」—— 详情页/弹窗里也有 textarea，会写错地方。
+  const chatInput = () => {
+    const real = document.querySelector('#chat-input.chat-input');
+    if (real && visible(real)) return real;
+    return (
+      Array.from(document.querySelectorAll('.input-box textarea.input')).filter(visible)[0] ?? null
+    );
+  };
+  /**
+   * 聊天页的「发送」按钮 —— **必须挑可见的那个**。
+   *
+   * ⚠️ 聊天页里有两个发送按钮：
+   *    button.btn-send            ← 新的，真按钮
+   *    .input-box .btn-sure-v2    ← 旧版残留，**一直 hidden、一直带 disabled 类**
+   *  用 querySelector（逗号列表按文档顺序取第一个匹配）会拿到**那个隐藏的旧按钮**
+   *  → submitReady 永远是 false（2026-11-15 实测：24/100 次失败都是 still-disabled）
+   *  → 而且点发送也是点它，等于什么都没发。
+   */
+  const submitBtn = () => {
+    const cands = Array.from(
+      document.querySelectorAll('button.btn-send, .input-box .btn-sure-v2, .input-box .btn-v2'),
+    );
+    return cands.find(visible) ?? null;
+  };
+
+  /* ---------------- 两个表面的状态 ---------------- */
+
+  const greetState = () => {
+    const o = {};
+    o.dialogOpen = /dialog-open/.test(String(document.body.className || ''));
     const btn = sendBtn();
-    out.hasSend = !!btn;
-    out.sendText = txt(btn);
-    out.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
+    o.hasSend = !!btn;
+    o.sendText = txt(btn);
+    o.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
     // 招呼语模板
-    out.templates = Array.from(document.querySelectorAll('ul.message > li'))
+    o.templates = Array.from(document.querySelectorAll('ul.message > li'))
       .map((li) => txt(li))
       .filter(Boolean);
     // 可见的输入框（自定义招呼语）
-    out.inputs = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]'))
+    o.inputs = Array.from(
+      document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]'),
+    )
       .filter(visible)
       .map((el) => ({
         tag: el.tagName,
@@ -991,8 +1134,50 @@ function pageGreetTask(arg) {
         value: String(el.value ?? ''),
         maxlength: Number(el.getAttribute('maxlength') || 0),
       }));
-    out.url = location.href;
+    o.url = location.href;
+    return o;
+  };
+
+  const chatState = () => {
+    const o = {};
+    o.url = location.href;
+    const ta = chatInput();
+    const btn = submitBtn();
+    o.hasInput = !!ta;
+    o.hasBox = !!inputBox();
+    // ⚠️ **可见性很关键**：消息页没打开会话时，输入框在 DOM 里但**是隐藏的**
+    //    （那时候往里写字是白写 —— 消息根本没地方发）。
+    o.boxVisible = !!(ta && visible(ta));
+    o.value = ta ? String(ta.value || '') : '';
+    o.submitExists = !!btn;
+    // 提交按钮是「有内容才解禁」的 —— 解禁了才能点
+    o.submitReady = !!btn && visible(btn) && !/disabled/.test(String(btn.className || ''));
+    // 当前会话是谁
+    const head = document.querySelector('.chat-conversation .name-text, .top-info-content .name-text');
+    o.convName = txt(head);
+    // 最近几条消息（确认发出去了没有）
+    const items = document.querySelectorAll('.im-list .message-item');
+    const msgs = [];
+    for (let i = Math.max(0, items.length - 5); i < items.length; i++) {
+      msgs.push(txt(items[i]).slice(0, 80));
+    }
+    o.messages = msgs;
+    o.messageCount = items.length;
+    return o;
+  };
+
+  /* ---------------- 分派 ---------------- */
+
+  if (mode === 'state') {
+    if (surface === 'both') {
+      out.both = { greet: greetState(), chat: chatState() };
+      out.ok = true;
+      out.step = 'state';
+      return out;
+    }
+    Object.assign(out, surface === 'greet' ? greetState() : chatState());
     out.ok = true;
+    out.step = 'state';
     return out;
   }
 
@@ -1004,49 +1189,73 @@ function pageGreetTask(arg) {
   }
 
   if (mode === 'type') {
-    // ⚠️ **只认弹窗自己的输入框**（textarea.input-area），不许回退到别的框。
-    //
-    // 2026-11-15 实测的 bug：原来这里有一串 fallback（任意可见 textarea →
-    // 任意可见 contenteditable）。弹窗刚被检测到、页面就跳到聊天页时，
-    // 文字被写进了**聊天页的输入框**，但调用方以为写的是弹窗 → 去等弹窗的
-    // 「发送」解禁 → 那个按钮从没被写过 → 永远不解禁（still-disabled），
-    // 而且那句话还留在聊天输入框里没发出去。
-    //
-    // 现在各写各的，并回报 surface，调用方只认匹配的那个。
-    const el = document.querySelector('textarea.input-area');
-    if (!el || !visible(el)) {
-      out.ok = false;
-      out.step = 'no-input';
+    if (surface === 'greet') {
+      const el = greetInput();
+      if (!el) {
+        out.ok = false;
+        out.step = 'no-input';
+        out.surface = 'greet';
+        return out;
+      }
       out.surface = 'greet';
+      writeInto(el, String(A.text ?? ''));
+      out.ok = true;
+      out.step = 'typed';
+      out.value = String(el.value ?? '');
+      out.used = el.tagName + '.' + String(el.className || '');
+      const btn = sendBtn();
+      out.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
       return out;
     }
-    out.surface = 'greet';
-    const text = String(A.text ?? '');
-    writeInto(el, text);
+    const ta = chatInput();
+    if (!ta || !visible(ta)) {
+      out.ok = false;
+      out.step = 'no-input';
+      out.detail = ta ? '输入框在，但不可见（会话没打开）' : '没有输入框';
+      return out;
+    }
+    writeInto(ta, String(A.text ?? ''));
     out.ok = true;
     out.step = 'typed';
-    out.value = String(el.value ?? '');
-    out.used = el.tagName + '.' + String(el.className || '');
-    const btn = sendBtn();
-    out.sendReady = !!btn && !/disable/i.test(String(btn.className || ''));
+    out.surface = 'chat';
+    out.value = ta.isContentEditable ? String(ta.textContent || '') : String(ta.value || '');
+    const btn = submitBtn();
+    out.submitReady = !!btn && !/disabled/.test(String(btn.className || ''));
     return out;
   }
 
-  if (mode === 'send') {
-    const btn = sendBtn();
-    if (!btn) {
-      out.ok = false;
-      out.step = 'no-send';
+  if (mode === 'send' || mode === 'submit') {
+    if (surface === 'greet') {
+      const btn = sendBtn();
+      if (!btn) {
+        out.ok = false;
+        out.step = 'no-send';
+        return out;
+      }
+      if (/disable/i.test(String(btn.className || ''))) {
+        out.ok = false;
+        out.step = 'still-disabled';
+        return out;
+      }
+      btn.click();
+      out.ok = true;
+      out.step = 'sent';
       return out;
     }
-    if (/disable/i.test(String(btn.className || ''))) {
+    const btn = submitBtn();
+    if (!btn) {
+      out.ok = false;
+      out.step = 'no-submit';
+      return out;
+    }
+    if (/disabled/.test(String(btn.className || ''))) {
       out.ok = false;
       out.step = 'still-disabled';
       return out;
     }
     btn.click();
     out.ok = true;
-    out.step = 'sent';
+    out.step = 'submitted';
     return out;
   }
 
@@ -1099,12 +1308,28 @@ function pageDetailTask(arg) {
     out.url = location.href;
 
     if (mode === 'read') {
-      // JD 正文：页面顺序是「职位描述 → 公司介绍 → 竞争力分析 → 更多职位」，
-      // 所以第一个 .job-sec-text 就是 JD（第二个是公司介绍）。
-      const texts = Array.from(document.querySelectorAll('.job-sec-text'))
-        .map((e) => txt(e))
-        .filter((t) => t.length > 40);
-      out.jd = texts[0] ?? '';
+      // JD 正文：页面顺序是「职位描述 → 公司介绍 → 竞争力分析 → 更多职位」。
+      //
+      // ⚠️ **不能先按长度过滤再取第 0 个** —— JD 短于阈值时会被过滤掉，
+      //    第 0 个就变成「公司介绍」了；而调用方只在校验结果为空时才退回接口，
+      //    于是大模型拿着公司简介去判断岗位。
+      //    所以：先按**标题**认出哪一块是职位描述，取不到再按页面顺序取第一个。
+      const sections = Array.from(
+        document.querySelectorAll('.job-sec-text, .job-detail-text, .job-detail-desc'),
+      )
+        .map((el) => {
+          const holder = el.closest('.job-sec, .job-detail-section') || el.parentElement;
+          const title = txt(holder && holder.querySelector('h3, h4, .job-sec-title, .job-detail-title'));
+          return { title, text: txt(el) };
+        })
+        .filter((s) => s.text.length > 0);
+
+      const jdSection =
+        sections.find((s) => /职位描述|岗位描述|工作职责|职位信息|岗位职责/.test(s.title)) ||
+        sections[0] ||
+        null;
+      out.jd = jdSection ? jdSection.text : '';
+      out.jdTitle = jdSection ? jdSection.title : '';
       out.jdLen = out.jd.length;
       out.ok = true;
       out.step = 'read';
@@ -1151,324 +1376,7 @@ function pageDetailTask(arg) {
  *
  * ⚠️ **页面侧不许等待**：所有 sleep 放 Node 侧（后台标签页的定时器会被限流/冻结）。
  */
-function pageChatTask(arg) {
-  const A = arg || {};
-  const mode = A.mode || 'state';
-  /**
-   * 把文字写进输入框，并让 Vue 知道。
-   *
-   * ⚠️ **必须是函数内的局部定义**：本函数会被 executeScript 序列化后注入页面，
-   *    注入的只有函数自己的源码 —— 引用模块级函数在页面里是 ReferenceError，
-   *    而且表现为**静默的 null**（executeScript 不报错，结果直接没了）。
-   *    2026-11-15 实测：type 模式调了模块级的 writeInto → 一整晚 no-input。
-   *
-   * - contenteditable 的 div（新版聊天页的 #chat-input）：设 textContent
-   * - textarea：走原生 value setter（直接赋值 Vue 的 v-model 收不到）
-   * 两种都要再派发 input / change 事件。
-   */
-  const writeInto = (el, text) => {
-    if (el.isContentEditable) {
-      // contenteditable（聊天页的 #chat-input）：**用 execCommand 插入**。
-      //
-      // 为什么不能只设 textContent + input 事件：
-      //   BOSS 聊天框是自家编辑器，它认的是「真的编辑动作」——
-      //   execCommand('insertText') 会派发 beforeinput/input（带正确的数据），
-      //   而合成的 input 事件它不一定接 → 文字进去了，发送按钮却不解禁
-      //   （2026-11-15 实测：24/100 次失败都是 still-disabled）。
-      //   execCommand 失败再退回 textContent + input。
-      let inserted = false;
-      try {
-        el.focus();
-        const sel = window.getSelection();
-        if (sel) {
-          const range = document.createRange();
-          range.selectNodeContents(el);
-          sel.removeAllRanges();
-          sel.addRange(range);
-        }
-        inserted = document.execCommand('insertText', false, text);
-      } catch (e) {
-        inserted = false;
-      }
-      if (!inserted || !el.textContent) {
-        el.textContent = text;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return;
-    }
-    try {
-      const proto = Object.getPrototypeOf(el);
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-      setter.call(el, text);
-    } catch (e) {
-      el.value = text;
-    }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  };
 
-
-  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
-  const out = { mode, ok: false, step: mode, at: Date.now() };
-
-  /**
-   * 聊天页的输入框 —— **有两个**，别搞错：
-   *   DIV#chat-input.chat-input  contenteditable  ← 真正能用的（新版聊天页）
-   *   DIV.input-box > textarea.input                ← 旧版残留，**一直隐藏**
-   * 早期对着后者写，怎么都写不进去（消息发不出去就是这个原因）。
-   */
-  const inputBox = () => document.querySelector('.input-box');
-  // ⚠️ 只认**聊天页自己的**输入框：#chat-input（新版）或 .input-box 里的旧版 textarea。
-  //    不能拿「任意可见 textarea」—— 详情页/弹窗里也有 textarea，会写错地方。
-  const textarea = () => {
-    const real = document.querySelector('#chat-input.chat-input');
-    if (real && visible(real)) return real;
-    return (
-      Array.from(document.querySelectorAll('.input-box textarea.input')).filter(visible)[0] ?? null
-    );
-  };
-  /**
-   * 聊天页的「发送」按钮 —— **必须挑可见的那个**。
-   *
-   * ⚠️ 聊天页里有两个发送按钮：
-   *    button.btn-send            ← 新的，真按钮
-   *    .input-box .btn-sure-v2    ← 旧版残留，**一直 hidden、一直带 disabled 类**
-   *  用 querySelector（逗号列表按文档顺序取第一个匹配）会拿到**那个隐藏的旧按钮**
-   *  → submitReady 永远是 false（2026-11-15 实测：24/100 次失败都是 still-disabled）
-   *  → 而且点发送也是点它，等于什么都没发。
-   */
-  const submitBtn = () => {
-    const cands = Array.from(
-      document.querySelectorAll('button.btn-send, .input-box .btn-sure-v2, .input-box .btn-v2'),
-    );
-    return cands.find(visible) ?? null;
-  };
-  const visible = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
-
-  if (mode === 'state') {
-    out.url = location.href;
-    const ta = textarea();
-    const btn = submitBtn();
-    out.hasInput = !!ta;
-    out.hasBox = !!inputBox();
-    // ⚠️ **可见性很关键**：消息页没打开会话时，输入框在 DOM 里但**是隐藏的**
-    //    （那时候往里写字是白写 —— 消息根本没地方发）。
-    out.boxVisible = !!(ta && visible(ta));
-    out.value = ta ? String(ta.value || '') : '';
-    out.submitExists = !!btn;
-    // 提交按钮是「有内容才解禁」的 —— 解禁了才能点
-    out.submitReady = !!btn && visible(btn) && !/disabled/.test(String(btn.className || ''));
-    // 当前会话是谁
-    const head = document.querySelector('.chat-conversation .name-text, .top-info-content .name-text');
-    out.convName = txt(head);
-    // 最近几条消息（确认发出去了没有）
-    const items = document.querySelectorAll('.im-list .message-item');
-    const msgs = [];
-    for (let i = Math.max(0, items.length - 5); i < items.length; i++) msgs.push(txt(items[i]).slice(0, 80));
-    out.messages = msgs;
-    out.messageCount = items.length;
-    out.ok = true;
-    out.step = 'state';
-    return out;
-  }
-
-  if (mode === 'type') {
-    // ⚠️ 页面函数保持同步 —— **等待一律放 Node 侧**（页面里的 await 在
-    //    后台标签页会被冻结，而且这里本来就不是 async 函数）。
-    const ta = textarea();
-    if (!ta || !visible(ta)) {
-      out.ok = false;
-      out.step = 'no-input';
-      out.detail = ta ? '输入框在，但不可见（会话没打开）' : '没有输入框';
-      return out;
-    }
-    const text = String(A.text ?? '');
-    writeInto(ta, text);
-    out.ok = true;
-    out.step = 'typed';
-    out.surface = 'chat';
-    out.value = ta.isContentEditable ? String(ta.textContent || '') : String(ta.value || '');
-    const btn = submitBtn();
-    out.submitReady = !!btn && !/disabled/.test(String(btn.className || ''));
-    return out;
-  }
-
-  if (mode === 'submit') {
-    const btn = submitBtn();
-    if (!btn) {
-      out.ok = false;
-      out.step = 'no-submit';
-      return out;
-    }
-    if (/disabled/.test(String(btn.className || ''))) {
-      out.ok = false;
-      out.step = 'still-disabled';
-      return out;
-    }
-    btn.click();
-    out.ok = true;
-    out.step = 'submitted';
-    return out;
-  }
-
-  out.ok = false;
-  out.step = 'unknown-mode';
-  return out;
-}
-
-/**
- * 「职位」页任务 —— 主动投递用。
- *
- * 页面：/web/geek/jobs?ka=header-jobs
- *   左侧 .job-card-wrap 卡片列表，右侧 .job-detail-container 是选中卡片的详情（JD + 立即沟通）
- *
- * 模式（arg.mode）：
- *   scan      读卡片列表 + 当前选中卡片的 JD / HR / 「立即沟通」按钮
- *   pick      按 jobId 点开对应卡片（点完右侧 JD 才会换成它）
- *   requests  读最近发出去的接口请求 URL —— 用来还原页面真实的查询参数
- *
- * ⚠️ 同样**页面侧不许等待**：等渲染由 Node 侧控制。
- */
-function pageJobsTask(arg) {
-  const A = arg || {};
-  const mode = A.mode || 'scan';
-  const txt = (e) => ((e && (e.innerText || e.textContent)) || '').replace(/\s+/g, ' ').trim();
-  const out = { mode, ok: false, step: mode, at: Date.now() };
-
-  /** 左侧卡片列表 */
-  const readCards = () => {
-    const els = Array.from(document.querySelectorAll('.job-card-wrap'));
-    return els.map((el, idx) => {
-      const nameEl = el.querySelector('.job-name');
-      const salEl = el.querySelector('.job-salary');
-      const href = nameEl ? String(nameEl.getAttribute('href') || '') : '';
-      const m = href.match(/job_detail\/([A-Za-z0-9_-]+)\.html/);
-      const foot = el.querySelector('.job-card-footer');
-      return {
-        idx,
-        jobId: m ? m[1] : '',
-        name: txt(nameEl),
-        salary: txt(salEl),
-        tags: Array.from(el.querySelectorAll('.tag-list li')).map(txt),
-        company: txt(foot && foot.querySelector('.boss-name')),
-        location: txt(foot && foot.querySelector('.company-location')),
-        active: /(^|\s)active(\s|$)/.test(String(el.className || '')),
-        href,
-      };
-    });
-  };
-
-  /** 右侧详情面板 */
-  const readDetail = () => {
-    const panel = document.querySelector('.job-detail-container');
-    if (!panel) return { present: false };
-    const chatBtn = panel.querySelector('a.op-btn.op-btn-chat');
-    // JD 正文：面板里有好几个候选容器，取正文最长的那个
-    const cands = Array.from(
-      panel.querySelectorAll('[class*="desc"], [class*="job-sec"], [class*="text"], [class*="content"]'),
-    )
-      .map((e) => txt(e))
-      .filter((t) => t.length > 30);
-    cands.sort((a, b) => b.length - a.length);
-    // HR 名字：「陈先生」「申女士」这种
-    const all = txt(panel);
-    const hrMatch = all.match(/([一-龥]{1,4}(先生|女士|老师))/);
-    return {
-      present: true,
-      name: txt(panel.querySelector('.job-name')),
-      salary: txt(panel.querySelector('.job-salary')),
-      jd: (cands[0] || '').slice(0, 4000),
-      jdLen: (cands[0] || '').length,
-      hr: hrMatch ? hrMatch[1] : '',
-      chatBtn: !!chatBtn,
-      chatBtnKa: chatBtn ? String(chatBtn.getAttribute('ka') || '') : '',
-      chatBtnText: txt(chatBtn),
-    };
-  };
-
-  if (mode === 'scan') {
-    const cards = readCards();
-    out.cards = cards;
-    out.cardCount = cards.length;
-    out.detail = readDetail();
-    out.ok = true;
-    out.step = 'scan';
-    return out;
-  }
-
-  if (mode === 'pick') {
-    const want = String(A.jobId || '');
-    const cards = readCards();
-    const hit = cards.find((c) => c.jobId && c.jobId === want);
-    if (!hit) {
-      out.ok = false;
-      out.step = 'no-card';
-      out.detail = '列表里没有这个岗位：' + want;
-      return out;
-    }
-    const el = document.querySelectorAll('.job-card-wrap')[hit.idx];
-    const target = el.querySelector('.job-name') || el;
-    target.click();
-    out.ok = true;
-    out.step = 'picked';
-    out.jobId = hit.jobId;
-    out.name = hit.name;
-    return out;
-  }
-
-  if (mode === 'chat-click') {
-    // 点「立即沟通」。
-    //
-    // ⚠️ **必须异步点**：点了之后页面可能跳转（执行上下文被销毁 → executeScript
-    // 报 "Execution context was destroyed"，结果就丢了）。所以用 setTimeout(0)
-    // 把点击推迟到本次脚本返回**之后**，再由 Node 侧去查「聊跑到哪去了」。
-    const btn = document.querySelector('a.op-btn.op-btn-chat');
-    if (!btn) {
-      out.ok = false;
-      out.step = 'no-chat-btn';
-      return out;
-    }
-    const ka = String(btn.getAttribute('ka') || '');
-    const m = ka.match(/chat_([A-Za-z0-9_-]+)/);
-    out.ka = ka;
-    out.jobId = m ? m[1] : '';
-    out.name = txt(document.querySelector('.job-detail-container .job-name'));
-    out.beforeUrl = location.href;
-    out.chatBtnText = txt(btn);
-    try {
-      setTimeout(() => {
-        try { btn.click(); } catch (e) { /* ignore */ }
-      }, 0);
-    } catch (e) {
-      /* ignore */
-    }
-    out.ok = true;
-    out.step = 'chat-clicked';
-    return out;
-  }
-
-  if (mode === 'requests') {
-    // 页面真实发出去的接口 —— 拿来还原查询参数，不靠猜
-    const urls = [];
-    try {
-      for (const e of performance.getEntriesByType('resource')) {
-        const n = String(e.name || '');
-        if (n.includes('/wapi/') || n.includes('/api/')) urls.push(n);
-      }
-    } catch (e) {
-      /* ignore */
-    }
-    out.ok = true;
-    out.step = 'requests';
-    out.urls = urls.slice(-150);
-    return out;
-  }
-
-  out.ok = false;
-  out.step = 'unknown-mode';
-  return out;
-}
 
 /**
  * 「我的在线简历」任务 —— /web/geek/resume
@@ -2285,24 +2193,81 @@ async function openTabFor(url) {
   return { tab, windowId: w.id, createdWindow: true };
 }
 
-/** 等标签页加载完（已经加载完就直接返回，不用干等） */
+/**
+ * 等标签页加载完（已经加载完就直接返回，不用干等）。
+ *
+ * ⚠️ **必须先订阅、再读状态** —— 反过来的话，
+ *    「状态读完」到「订阅成功」之间正好完成的那次加载会被漏掉，
+ *    只能干等到超时（10 秒白等一轮）。
+ */
 async function waitForTabLoad(tabId, timeoutMs) {
-  try {
-    const t = await chrome.tabs.get(tabId);
-    if (!t || t.status === 'complete') return;
-  } catch (e) {
-    return;
-  }
   await new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch (e) { /* ignore */ }
+      resolve();
+    };
     const onUpdated = (id, info) => {
-      if (id === tabId && info.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        resolve();
-      }
+      if (id === tabId && info.status === 'complete') done();
     };
     chrome.tabs.onUpdated.addListener(onUpdated);
-    setTimeout(resolve, timeoutMs); // 超时兜底
+    // 订阅好了再看状态 —— 已经加载完就别等了
+    chrome.tabs.get(tabId).then((t) => {
+      if (!t || t.status === 'complete') done();
+    }).catch(() => done());
+    setTimeout(done, timeoutMs); // 超时兜底
   });
+}
+
+/**
+ * 等标签页的**地址**真的换成 wantUrl（轮询到状态成立为止）。
+ *
+ * 为什么需要它：chrome.tabs.update 是「导航**请求**发出」就返回，
+ * 而 tabs.get().status 要到新文档 commit 才翻成 'loading' ——
+ * 这中间旧页面还是 'complete'，waitForTabLoad 会立刻返回，
+ * executeScript 就跑在**上一个岗位**的 DOM 上（读到的 JD、岗位名全是上一个的）。
+ * 所以导航完必须确认地址真的换过去了。
+ *
+ * 比的是 **pathname**：页面的 query 可能被改写（安全参数），pathname 不会。
+ */
+async function waitForTabUrl(tabId, wantUrl, timeoutMs) {
+  const wantPath = (() => {
+    try { return new URL(wantUrl).pathname; } catch (e) { return ''; }
+  })();
+  const deadline = Date.now() + timeoutMs;
+  // ⚠️ **必须先观察到「导航在途」才允许收手** ——
+  //    tabs.update 之后的几毫秒里，tab.url 还是**旧地址**、status 还是
+  //    **旧页面的 complete**（新文档要等 commit 才会换）——
+  //    这时候看到 complete 绝不能当成「加载完了」。
+  //    真正能区分的信号有两个：
+  //      · tab.pendingUrl —— 导航在途时才有值（Chrome 把在途地址放这儿）
+  //      · status 翻成 'loading'
+  let sawNavigating = false;
+  for (;;) {
+    let t = null;
+    try {
+      t = await chrome.tabs.get(tabId);
+    } catch (e) {
+      return null; // 标签页没了
+    }
+    if (!t) return null;
+    let path = '';
+    try { path = new URL(String(t.url || '')).pathname; } catch (e) { path = ''; }
+    // ok=false = 没落到目标地址（重定向 / 超时）
+    if (wantPath && path === wantPath) return { tab: t, ok: true };
+    const pending = String(t.pendingUrl || '');
+    if (pending) {
+      sawNavigating = true; // 观察到导航在途
+    } else if (sawNavigating) {
+      // 导航结束了、pendingUrl 清空、但地址不是我们要的 → 重定向（跳登录页等）。
+      // 这时再等也是白等，返回让调用方看到真实地址。
+      return { tab: t, ok: false };
+    }
+    if (Date.now() >= deadline) return { tab: t, ok: false };
+    await new Promise((r) => setTimeout(r, 150));
+  }
 }
 
 /**

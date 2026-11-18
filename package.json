@@ -1,6 +1,6 @@
 {
   "name": "mishu",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "BOSS直聘个人助手：自动投递附件简历 + 主动打招呼（大模型逐条写开场白）",

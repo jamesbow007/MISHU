@@ -19,7 +19,7 @@ import { createPageTransport } from './api/page-transport.js';
 
 const server = new McpServer({
   name: 'mishu',
-  version: '0.2.0',
+  version: '0.3.1',
 });
 
 const json = (obj: unknown) => ({

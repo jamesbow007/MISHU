@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MISHU",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "MISHU 的 Chrome 扩展：在页面上下文里发请求（带齐登录 cookie），并读取「新招呼」标签页的状态。",
   "permissions": ["cookies", "alarms", "tabs", "scripting", "storage"],
   "host_permissions": [

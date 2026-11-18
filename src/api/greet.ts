@@ -50,7 +50,10 @@ export interface JobPage {
  */
 export async function openJobPage(job: Job, reuseTabId?: number | null): Promise<JobPage> {
   const read = (opts: Record<string, unknown>) =>
-    runPageFnFull('detail', { mode: 'read' }, { keep: true, timeoutMs: 30_000, ...opts });
+    // ⚠️ 超时必须**小于**桥接的 20 秒硬上限 —— 写了 30 秒也没用，
+    //    bridge 到点就回 504（还不带 tabId，标签页就泄漏了）。
+    //    18 秒：客户端自己收手，不至于让 bridge 那边悬着。
+    runPageFnFull('detail', { mode: 'read' }, { keep: true, timeoutMs: 18_000, ...opts });
 
   let r: { data: any; tabId: number | null };
   if (reuseTabId) {
@@ -70,7 +73,10 @@ export async function openJobPage(job: Job, reuseTabId?: number | null): Promise
   return {
     tabId: r.tabId!,
     jd: String(d.jd ?? ''),
-    name: String(d.name ?? job.name),
+    // ⚠️ 用 || 不用 ?? —— 页面上读不到时给的是**空串**，
+    //    `'' ?? job.name` 还是空串 → 岗位名这一半校验就被悄悄关掉了
+    //    （只剩「张先生/李女士」这种重名匹配）。
+    name: String(d.name || job.name),
     job,
   };
 }
@@ -103,20 +109,35 @@ async function typeAndSend(
   let mode: 'greet' | 'chat' | null = null;
   let convName = '';
 
-  // ① 等「能发消息的地方」出现（弹窗 或 聊天页）。
-  //    6 秒没动静 = 点击大概率没生效（页面 JS 未就绪，点击处理器还没挂上）→ 再点一次。
-  //    判据是「两个表面都没出现」这个事实，不是猜时间。
-  //    两个状态查询并发发（各是一次桥接往返，串行白等）。
-  let firstSeen: 'greet' | 'chat' | null = null;
-  for (;;) {
+  // 读两个表面（弹窗 / 聊天页）的状态。
+  //
+  // ⚠️ **一次往返拿两个** —— 桥接是单飞的（一次只处理一个任务），
+  //    并发问两个也只是排队，省不掉往返。以前这一步每 400 毫秒要花两趟。
+  const readSurfaces = async (): Promise<{ g: any; c: any }> => {
+    const both = await runPageFn('surfaces', { mode: 'state' }, { tabId }).catch(() => null);
+    if (both?.both) return { g: both.both.greet, c: both.both.chat };
+    // 扩展还没更新（没返回 both）→ 退回分别问两次
     const [g, c] = await Promise.all([
       runPageFn('greet', { mode: 'state' }, { tabId }).catch(() => null),
       runPageFn('chat', { mode: 'state' }, { tabId }).catch(() => null),
     ]);
+    return { g, c };
+  };
+
+  // ① 等「能发消息的地方」出现（弹窗 或 聊天页）。
+  //    一直没动静 = 点击大概率没生效（页面 JS 未就绪，点击处理器还没挂上）→ 再点一次。
+  //    判据是「两个表面都没出现」这个事实，不是猜时间。
+  let firstSeen: 'greet' | 'chat' | null = null;
+  for (;;) {
+    const { g, c } = await readSurfaces();
     if (g?.dialogOpen && g?.hasSend) { firstSeen = 'greet'; break; }
     if (c?.convName) convName = c.convName;
     if (c?.boxVisible && c?.hasInput) { firstSeen = 'chat'; break; }
-    if (!reClicked && Date.now() - startAt > 6_000) {
+    // ⚠️ **12 秒才考虑重试点**（原来 6 秒）—— 弹窗实测要 20 多秒才渲染好，
+    //    6 秒时第一次点击往往还在「打开中」，这时候再点一下
+    //    可能把刚开的弹窗点没了、或者开出第二个会话。
+    //    重点前还会先看一眼按钮状态（见 reClick 的实现），确认上次没生效才点。
+    if (!reClicked && Date.now() - startAt > 12_000) {
       await reClick();
       reClicked = true;
     }
@@ -146,10 +167,7 @@ async function typeAndSend(
     if (b) { mode = order[1]!; if (b.convName) convName = b.convName; break; }
     if (Date.now() >= typeDeadline) {
       // 取证：把失败瞬间的两个状态带回来 —— 不带证据的 no-input 没法修（这次的教训）
-      const [g2, c2] = await Promise.all([
-        runPageFn('greet', { mode: 'state' }, { tabId }).catch(() => null),
-        runPageFn('chat', { mode: 'state' }, { tabId }).catch(() => null),
-      ]);
+      const { g: g2, c: c2 } = await readSurfaces();
       return {
         ok: false,
         step: 'no-input',
@@ -213,14 +231,31 @@ export async function greetInPage(
 
   try {
     // 点「立即沟通 / 继续沟通」。
-    // ⚠️ 点击可能没生效（页面 JS 未就绪）—— typeAndSend 里靠「表面没出现」再点一次
-    const clicked = await runPageFn('detail', { mode: 'chat-click' }, { tabId: page.tabId });
-    if (!clicked?.ok) {
-      out.step = clicked?.step ?? 'no-chat-btn';
-      return out;
+    // ⚠️ **按钮可能还没渲染出来** —— 详情页是 SPA，页面加载完 ≠ 按钮画好了。
+    //    以前找不到按钮就直接判失败（no-chat-btn），现在轮询到按钮真的在为止
+    //    （等状态，不等时长）。
+    //    注意：扩展端「按钮不存在」才返回失败，「按钮在」就点一下并返回成功 ——
+    //    所以这个循环**不会连点**，只是在等按钮出现。
+    const btnDeadline = Date.now() + 12_000;
+    let clicked: any = null;
+    for (;;) {
+      clicked = await runPageFn('detail', { mode: 'chat-click' }, { tabId: page.tabId }).catch(() => null);
+      if (clicked?.ok) break;
+      if (Date.now() >= btnDeadline) {
+        out.step = clicked?.step ?? 'no-chat-btn';
+        out.detail = '页面上找不到「立即沟通」按钮';
+        return out;
+      }
+      await sleep(1000);
     }
 
     const r = await typeAndSend(page.tabId, greeting, async () => {
+      // ⚠️ **重点之前先看一眼按钮** —— 如果上一次点击其实生效了
+      //    （按钮文案从「立即沟通」变成「继续沟通」），再点一下只会开出第二个会话，
+      //    反而把局面搞坏。确认还没生效才点。
+      const sc = await runPageFn('detail', { mode: 'scan' }, { tabId: page.tabId }).catch(() => null);
+      const btnText = String(sc?.btnText ?? '');
+      if (sc?.alreadyTalked || (btnText && !/立即沟通/.test(btnText))) return;
       await runPageFn('detail', { mode: 'chat-click' }, { tabId: page.tabId }).catch(() => null);
     });
     if (!r.ok) {
@@ -262,12 +297,20 @@ export async function greetInPage(
  *   服务端是唯一可靠的判据。
  *
  * 找会话：按「职位名 + HR 名字」匹配 —— 同一个账号里可能有多个同名 HR。
+ *
+ * ⚠️ **只能靠 historyMsg，没法只看会话列表**：
+ *   会话列表接口（labelId=0）返回的字段里**没有最后一条消息**
+ *   （实测 470 条会话全是空的）—— lastMsg 是「补详情」那一步才有的字段。
+ *   而且就算补上了也不能只看最后一条：系统消息（附件简历）和 HR 的回复
+ *   都会把招呼语顶下去 —— 实测三个已联系过的 HR，lastMsg 都不是招呼语。
+ *   所以老老实实拉消息历史。
  */
 export async function verifyGreeting(
   client: BossClient,
   job: Job,
   greeting: string,
   sessions?: ChatSession[],
+  opt: { maxCandidates?: number } = {},
 ): Promise<boolean> {
   let list: ChatSession[];
   try {
@@ -284,7 +327,11 @@ export async function verifyGreeting(
   if (!cands.length) return false;
 
   const head = greeting.slice(0, 12);
-  for (const s of cands) {
+  // ⚠️ **候选要封顶** —— bossName / 岗位名 为空时，上面的过滤对
+  //    **全部**会话都成立（几百条），每个候选一次 historyMsg
+  //    就是几百次请求。列表按最近活跃排序，取最前面几个足够。
+  const use = cands.slice(0, Math.max(1, opt.maxCandidates ?? 2));
+  for (const s of use) {
     try {
       const msgs = await listMessages(client, s, { limit: 10 });
       // ⚠️ **不能要求 from === 'me'**：服务端把「打招呼」这类消息记成对方发的

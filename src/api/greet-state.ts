@@ -42,9 +42,19 @@ export interface GreetState {
   stats: { day: string; sentToday: number; rounds: number };
 }
 
+/**
+ * 本地日期 YYYY-MM-DD。
+ *
+ * ⚠️ **不能用 toISOString()** —— 那是 UTC 日期，在东八区会比本地日历晚 8 小时，
+ *    「每日上限」会在**早上 8 点**就翻页重置（本地是半夜 12 点）。
+ */
+function localDay(d: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 function emptyState(): GreetState {
-  const today = new Date().toISOString().slice(0, 10);
-  return { version: 1, greeted: {}, bosses: {}, stats: { day: today, sentToday: 0, rounds: 0 } };
+  return { version: 1, greeted: {}, bosses: {}, stats: { day: localDay(), sentToday: 0, rounds: 0 } };
 }
 
 export function loadGreetState(): GreetState {
@@ -53,7 +63,7 @@ export function loadGreetState(): GreetState {
     if (!s || typeof s !== 'object') return emptyState();
     s.greeted ??= {};
     s.bosses ??= {};
-    s.stats ??= { day: new Date().toISOString().slice(0, 10), sentToday: 0, rounds: 0 };
+    s.stats ??= { day: localDay(), sentToday: 0, rounds: 0 };
     return s;
   } catch {
     return emptyState();
@@ -82,20 +92,22 @@ export function greetedRecently(
   cooldownDays: number,
   bossId?: string,
 ): boolean {
+  // ⚠️ cooldownDays <= 0 一律按 30 天算 —— 两处（按人 / 按岗位）必须一个口径，
+  //    不然同一个配置值在两个分支里含义相反。
+  const cool = cooldownDays > 0 ? cooldownDays : 30;
   // ① 按 HR 去重 —— 同一个 HR 挂了好几个岗位也不能打扰多次
   const b = bossId ? state.bosses?.[bossId] : undefined;
   if (b) {
     // 兼容老格式（纯时间戳 = 当成发成功过）
     const at = typeof b === 'number' ? b : b.at;
     const status = typeof b === 'number' ? 'sent' : b.status;
-    const days = status === 'sent' ? (cooldownDays <= 0 ? 30 : cooldownDays) : 1;
+    const days = status === 'sent' ? cool : 1;
     if (Date.now() - at < days * 24 * 60 * 60 * 1000) return true;
   }
   // ② 按岗位去重（老记录没有 bossId，只能靠这条兜底）
   const rec = state.greeted[jobId];
   if (!rec) return false;
-  const days = rec.status === 'sent' ? cooldownDays : 1;
-  if (days <= 0) return true;
+  const days = rec.status === 'sent' ? cool : 1;
   return Date.now() - (rec.at ?? 0) < days * 24 * 60 * 60 * 1000;
 }
 
@@ -120,8 +132,7 @@ export function backfillBosses(
 
 /** 今天已经打了几个招呼（跨天自动清零） */
 export function sentToday(state: GreetState): number {
-  const today = new Date().toISOString().slice(0, 10);
-  if (state.stats.day !== today) return 0;
+  if (state.stats.day !== localDay()) return 0;
   return state.stats.sentToday ?? 0;
 }
 
@@ -130,7 +141,7 @@ export function recordGreeting(
   state: GreetState,
   rec: Omit<GreetRecord, 'at'> & { at?: number },
 ): void {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDay();
   if (state.stats.day !== today) {
     state.stats.day = today;
     state.stats.sentToday = 0;
@@ -138,7 +149,28 @@ export function recordGreeting(
   state.greeted[rec.jobId] = { ...rec, at: rec.at ?? Date.now() };
   // 按「人」也记一笔 —— 免得他换个岗位又被打扰一次
   // （带上 status：失败的只挡一天，别把人锁死 30 天）
-  if (rec.bossId) state.bosses[rec.bossId] = { at: rec.at ?? Date.now(), status: rec.status };
+  //
+  // ⚠️ **成功不能被失败覆盖**：同一个 HR 的第一个岗位打成功了、
+  //    第二个岗位发失败了，这里要是直接覆盖，
+  //    他的 30 天冷却就被降成 1 天 —— 明天又来打扰他。
+  //    所以「已有的成功记录」优先保留；时间上取**更早**的那次
+  //    （冷却从最早那次算 —— 宁可多挡几天，也别多打扰）。
+  if (rec.bossId) {
+    const prev = state.bosses[rec.bossId];
+    const prevStatus = typeof prev === 'number' ? 'sent' : prev?.status;
+    // ⚠️ 老记录可能没有 at（或者根本不是数字）—— 用 0 的话
+    //    `Date.now() - 0` 是个巨大的数 → 30 天冷却**静默失效**。
+    const rawPrevAt = typeof prev === 'number' ? prev : prev?.at;
+    const prevAt = Number.isFinite(rawPrevAt) && (rawPrevAt as number) > 0 ? (rawPrevAt as number) : 0;
+    const at = rec.at ?? Date.now();
+    const prevSent = prevStatus === 'sent';
+    state.bosses[rec.bossId] =
+      prevSent && rec.status !== 'sent'
+        ? { at: prevAt || at, status: 'sent' } // 失败不降级成功
+        : prevSent
+          ? { at: prevAt ? Math.min(prevAt, at) : at, status: 'sent' } // 都是成功 → 从最早那次算
+          : { at, status: rec.status };
+  }
   if (rec.status === 'sent') state.stats.sentToday += 1;
 }
 
